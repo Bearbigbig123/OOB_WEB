@@ -68,356 +68,7 @@ from datetime import datetime, date
 import xlsxwriter
 from typing import Tuple
 
-# SPC CPK Dashboard specific functions
-def calculate_cpk_dashboard(raw_df: pd.DataFrame, chart_info: dict) -> dict:
-    """計算CPK指標，支援三種特性類型"""
-    if raw_df.empty:
-        return {'Cpk': None}
-    
-    mean = raw_df['point_val'].mean()
-    std = raw_df['point_val'].std()
-    characteristic = chart_info.get('Characteristics', '')
-    usl = chart_info.get('USL', None)
-    lsl = chart_info.get('LSL', None)
-    
-    cpk = None
-    if std > 0:
-        if characteristic == 'Nominal':
-            if usl is not None and lsl is not None:
-                cpu = (usl - mean) / (3 * std)
-                cpl = (mean - lsl) / (3 * std)
-                cpk = min(cpu, cpl)
-        elif characteristic in ['Smaller', 'Sigma']:
-            if usl is not None:
-                cpk = (usl - mean) / (3 * std)
-        elif characteristic == 'Bigger':
-            if lsl is not None:
-                cpk = (mean - lsl) / (3 * std)
-    
-    if cpk is not None:
-        cpk = round(cpk, 3)
-    return {'Cpk': cpk}
 
-
-def compute_cpk_windows(raw_df: pd.DataFrame, chart_info: dict, end_time: pd.Timestamp) -> dict:
-    """計算多時間窗口的CPK值"""
-    result = {'Cpk': None, 'Cpk_last_month': None, 'Cpk_last2_month': None}
-    
-    if raw_df is None or raw_df.empty:
-        return result
-    
-    if 'point_time' not in raw_df.columns:
-        result['Cpk'] = calculate_cpk_dashboard(raw_df, chart_info)['Cpk']
-        return result
-    
-    df = raw_df.copy()
-    df['point_time'] = pd.to_datetime(df['point_time'])
-    df = df[df['point_time'] <= end_time]
-    
-    if df.empty:
-        return result
-    
-    start1 = end_time - pd.DateOffset(months=1)
-    start2 = end_time - pd.DateOffset(months=2) 
-    start3 = end_time - pd.DateOffset(months=3)
-    
-    mask1 = (df['point_time'] > start1) & (df['point_time'] <= end_time)
-    mask2 = (df['point_time'] > start2) & (df['point_time'] <= start1)
-    mask3 = (df['point_time'] > start3) & (df['point_time'] <= start2)
-    
-    if mask1.any():
-        result['Cpk'] = calculate_cpk_dashboard(df[mask1], chart_info)['Cpk']
-    if mask2.any():
-        result['Cpk_last_month'] = calculate_cpk_dashboard(df[mask2], chart_info)['Cpk']
-    if mask3.any():
-        result['Cpk_last2_month'] = calculate_cpk_dashboard(df[mask3], chart_info)['Cpk']
-    
-    return result
-
-
-def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, 
-                             start_date: Optional[date] = None, 
-                             end_date: Optional[date] = None, 
-                             custom_mode: bool = False) -> str:
-    """生成SPC圖表並返回base64編碼"""
-    fig = plt.figure(figsize=(12, 8))
-    
-    # 創建GridSpec布局
-    import matplotlib.gridspec as gridspec
-    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1], 
-                          hspace=0.3, wspace=0.25)
-    
-    # 主SPC圖
-    ax_main = fig.add_subplot(gs[:, 0])
-    ax_box = fig.add_subplot(gs[0, 1])  # Box Plot
-    ax_qq = fig.add_subplot(gs[1, 1])   # QQ Plot
-    
-    if raw_df is None or raw_df.empty:
-        ax_main.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_main.transAxes)
-        ax_box.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_box.transAxes)
-        ax_qq.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_qq.transAxes)
-    else:
-        plot_df = raw_df.copy()
-        
-        # 日期過濾
-        if start_date and end_date and 'point_time' in plot_df.columns:
-            try:
-                plot_df['point_time'] = pd.to_datetime(plot_df['point_time'])
-                start_ts = pd.to_datetime(start_date)
-                end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-                filtered = plot_df[(plot_df['point_time'] >= start_ts) & (plot_df['point_time'] <= end_ts)]
-                if not filtered.empty:
-                    plot_df = filtered
-            except Exception:
-                pass
-        
-        if not plot_df.empty:
-            # 繪製主SPC圖
-            _draw_main_spc_chart_api(ax_main, plot_df, chart_info, start_date, end_date, custom_mode)
-            # 繪製Box Plot
-            _draw_box_plot_api(ax_box, plot_df, chart_info)
-            # 繪製QQ Plot
-            _draw_qq_plot_api(ax_qq, plot_df, chart_info)
-    
-    # 設置標題
-    group_name = chart_info.get('GroupName', '')
-    chart_name = chart_info.get('ChartName', '')
-    characteristics = chart_info.get('Characteristics', '')
-    ax_main.set_title(f"{group_name}@{chart_name}@{characteristics}", pad=18, fontsize=12)
-    
-    # Box Plot標題
-    if raw_df is not None and 'EQP_id' in raw_df.columns and not raw_df['EQP_id'].isna().all():
-        ax_box.set_title("Box Plot (by EQP_id)", fontsize=10)
-    else:
-        ax_box.set_title("Box Plot", fontsize=10)
-    
-    ax_qq.set_title("Q-Q Plot", fontsize=10)
-    
-    fig.tight_layout()
-    
-    # 轉換為base64
-    buffer = BytesIO()
-    fig.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
-    buffer.seek(0)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    plt.close(fig)
-    
-    return image_base64
-
-
-def _draw_main_spc_chart_api(ax, plot_df, chart_info, start_date, end_date, custom_mode):
-    """繪製主要的SPC控制圖"""
-    y = plot_df['point_val'].values
-    x = range(1, len(y) + 1)
-    
-    # 等距模式處理時間排序
-    if 'point_time' in plot_df.columns:
-        try:
-            plot_df = plot_df.sort_values('point_time').reset_index(drop=True)
-            y = plot_df['point_val'].values
-        except Exception:
-            pass
-    
-    # 標示時間區間
-    if 'point_time' in plot_df.columns and not plot_df.empty:
-        try:
-            times = pd.to_datetime(plot_df['point_time']).to_numpy()
-            tmin, tmax = times.min(), times.max()
-            
-            if custom_mode and start_date and end_date:
-                # 自訂模式：顯示自訂範圍
-                start_time = pd.to_datetime(start_date)
-                end_time = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-                windows = [(start_time, end_time, 'Custom', '#dbeafe')]
-            else:
-                # 原本邏輯：三個月窗口
-                end_sel = pd.to_datetime(end_date) if end_date else pd.Timestamp(tmax)
-                if end_sel > pd.Timestamp(tmax):
-                    end_sel = pd.Timestamp(tmax)
-                start1 = end_sel - pd.DateOffset(months=1)
-                start2 = end_sel - pd.DateOffset(months=2)
-                start3 = end_sel - pd.DateOffset(months=3)
-                windows = [
-                    (start1, end_sel, 'L0', '#dbeafe'),
-                    (start2, start1, 'L1', '#fef9c3'),
-                    (start3, start2, 'L2', '#ede9fe'),
-                ]
-            
-            text_trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
-            n = len(times)
-            
-            def t2ix_left(t):
-                return float(np.searchsorted(times, np.datetime64(t), side='left')) + 0.5
-            def t2ix_right(t):
-                return float(np.searchsorted(times, np.datetime64(t), side='right')) + 0.5
-            
-            x_min, x_max = 0.5, n + 0.5
-            for s, e, lab, col in windows:
-                s_clip = max(pd.Timestamp(s), pd.Timestamp(tmin))
-                e_clip = min(pd.Timestamp(e), pd.Timestamp(tmax))
-                if e_clip <= s_clip:
-                    continue
-                xl = max(x_min, t2ix_left(s_clip))
-                xr = min(x_max, t2ix_right(e_clip))
-                if xr <= xl:
-                    continue
-                ax.axvspan(xl, xr, color=col, alpha=0.25, zorder=0)
-                x_center = (xl + xr) / 2.0
-                ax.text(x_center, 1.04, lab, transform=text_trans, ha='center', va='top', 
-                       fontsize=8, color='#374151', alpha=0.9)
-        except Exception:
-            pass
-    
-    # 繪製資料點和線
-    ax.plot(x, y, linestyle='-', marker='o', color='#2563eb', markersize=4, linewidth=1.0)
-    
-    # 取得控制限
-    usl = chart_info.get('USL', None)
-    lsl = chart_info.get('LSL', None)
-    target = None
-    for key_t in ['Target', 'TARGET', 'TargetValue', '中心線', 'Center']:
-        if key_t in chart_info and pd.notna(chart_info.get(key_t)):
-            target = chart_info[key_t]
-            break
-    
-    mean_val = float(np.mean(y)) if len(y) else None
-    
-    # 標示超規點
-    if usl is not None:
-        ax.scatter([xi for xi, yi in zip(x, y) if yi > usl], 
-                  [yi for yi in y if yi > usl], 
-                  color='#dc2626', s=25, zorder=5)
-    if lsl is not None:
-        ax.scatter([xi for xi, yi in zip(x, y) if yi < lsl], 
-                  [yi for yi in y if yi < lsl], 
-                  color='#dc2626', marker='s', s=25, zorder=5)
-    
-    # 計算Y軸範圍
-    extra_vals = [v for v in [usl, lsl, target, mean_val] 
-                  if v is not None and not (isinstance(v, float) and np.isnan(v))]
-    if len(y) > 0:
-        ymin_sel = float(np.min(y))
-        ymax_sel = float(np.max(y))
-    else:
-        ymin_sel, ymax_sel = (0.0, 1.0)
-    if extra_vals:
-        ymin_sel = min(ymin_sel, min(extra_vals))
-        ymax_sel = max(ymax_sel, max(extra_vals))
-    rng = ymax_sel - ymin_sel
-    margin = 0.05 * rng if rng > 0 else 1.0
-    ax.set_ylim(ymin_sel - margin, ymax_sel + margin)
-    
-    # 繪製控制線
-    trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
-    
-    def segment_with_label(val, name, color, va='center'):
-        if val is None or (isinstance(val, float) and np.isnan(val)):
-            return
-        x0, x1 = 0.0, 0.96
-        ax.plot([x0, x1], [val, val], transform=trans, color=color, linestyle='--', linewidth=1.0)
-        ax.text(x1, val, name, transform=trans, color=color, va=va, ha='left', fontsize=8)
-    
-    segment_with_label(usl, 'USL', '#ef4444', va='center')
-    segment_with_label(lsl, 'LSL', '#ef4444', va='center')
-    segment_with_label(target, 'Target', '#f59e0b', va='center')
-    segment_with_label(mean_val, 'Mean', '#16a34a', va='center')
-    
-    # X軸刻度
-    if 'point_time' in plot_df.columns and not plot_df.empty:
-        times = plot_df['point_time'].tolist()
-        total = len(times)
-        if total <= 8:
-            tick_idx = list(range(1, total + 1))
-        else:
-            step = max(1, total // 6)
-            tick_idx = list(range(1, total + 1, step))
-            if tick_idx[-1] != total:
-                tick_idx.append(total)
-        labels = [times[i-1].strftime('%Y-%m-%d') for i in tick_idx]
-        ax.set_xticks(tick_idx)
-        ax.set_xticklabels(labels, rotation=30, ha='right', fontsize=8)
-    
-    ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.5)
-
-
-def _draw_box_plot_api(ax, plot_df, chart_info):
-    """繪製箱型圖"""
-    if plot_df.empty:
-        ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
-        return
-    
-    # 檢查是否有EQP_id欄位
-    if 'EQP_id' in plot_df.columns and not plot_df['EQP_id'].isna().all():
-        # 按EQP_id分組
-        grouped = plot_df.groupby('EQP_id')
-        eqp_ids = list(grouped.groups.keys())
-        
-        box_data = []
-        labels = []
-        
-        for eqp_id in sorted(eqp_ids):
-            group_data = grouped.get_group(eqp_id)['point_val'].values
-            if len(group_data) > 0:
-                box_data.append(group_data)
-                labels.append(str(eqp_id))
-        
-        if len(box_data) == 0:
-            ax.text(0.5, 0.5, "No Valid Data", ha='center', va='center', transform=ax.transAxes)
-            return
-        
-        box_plot = ax.boxplot(box_data, patch_artist=True, notch=False)
-        
-        # 設定顏色
-        colors = ['#87CEEB', '#98FB98', '#FFB6C1', '#F0E68C', '#DDA0DD', '#F5DEB3', '#B0E0E6']
-        for i, patch in enumerate(box_plot['boxes']):
-            patch.set_facecolor(colors[i % len(colors)])
-            patch.set_alpha(0.8)
-        
-        ax.set_xticklabels(labels, rotation=0, ha='center', fontsize=9)
-        ax.set_xlabel('')
-    else:
-        # 單一box plot
-        y = plot_df['point_val'].values
-        if len(y) == 0:
-            ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
-            return
-        
-        box_plot = ax.boxplot(y, patch_artist=True, notch=False)
-        box_plot['boxes'][0].set_facecolor('#87CEEB')
-        box_plot['boxes'][0].set_alpha(0.8)
-        
-        ax.set_xticks([])
-        ax.set_xlabel('')
-
-
-def _draw_qq_plot_api(ax, plot_df, chart_info):
-    """繪製Q-Q圖"""
-    y = plot_df['point_val'].values
-    if len(y) == 0:
-        ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
-        return
-    
-    try:
-        # 計算Q-Q plot資料
-        (osm, osr), (slope, intercept, r) = stats.probplot(y, dist="norm", plot=None)
-        
-        # 繪製資料點
-        ax.scatter(osm, osr, alpha=0.7, color='blue', s=20)
-        
-        # 繪製理論線
-        line_x = np.array([osm.min(), osm.max()])
-        line_y = slope * line_x + intercept
-        ax.plot(line_x, line_y, 'r-', linewidth=1.5, alpha=0.8, label=f'R²={r**2:.3f}')
-        
-        ax.set_xlabel('Theoretical Quantiles', fontsize=8)
-        ax.set_ylabel('Sample Quantiles', fontsize=8)
-        ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.3)
-        ax.tick_params(axis='both', which='major', labelsize=8)
-        ax.legend(fontsize=7, loc='lower right')
-        
-    except Exception as e:
-        ax.text(0.5, 0.5, f"Calculation Error:\n{str(e)}", ha='center', va='center',
-               transform=ax.transAxes, fontsize=8)
 
 
 class ProcessRequest(BaseModel):
@@ -579,17 +230,35 @@ class SplitRequest(BaseModel):
         pattern="^(Type3_Horizontal|Type2_Vertical)$",
     )
     input_files: List[str] = Field(description="List of CSV file paths to split")
-    output_folder: str = Field(description="Base output folder; 'raw_charts' will be created inside")
+    output_folder: Optional[str] = Field(
+        default=None, 
+        description="Base output folder; 'raw_charts' will be created inside. Defaults to 'input' if not specified"
+    )
 
 
 app = FastAPI(title="OOB/SPC FastAPI", version="1.0.0")
+
+# 全域變數：記住最後一次分割的輸出資料夾路徑
+_last_split_output_folder: Optional[str] = None
 
 
 def _default_paths() -> Dict[str, str]:
     """Resolve default file paths similar to the original UI app."""
     filepath = resource_path("input/All_Chart_Information.xlsx")
-    raw_dir = resource_path("input/raw_charts/")
-    return {"filepath": filepath, "raw_dir": raw_dir}
+    
+    # 如果有最後分割的資料夾，優先使用；否則使用預設路徑
+    if _last_split_output_folder and os.path.exists(_last_split_output_folder):
+        raw_dir = _last_split_output_folder
+    else:
+        raw_dir = resource_path("input/raw_charts/")
+    
+    return {
+        "filepath": filepath, 
+        "raw_dir": raw_dir,
+        # 新增 SPC CPK 所需的鍵名
+        "chart_excel_path": filepath,
+        "raw_data_directory": raw_dir
+    }
 
 
 def _read_csv_cached(cache: Dict[str, pd.DataFrame], filepath: str) -> Optional[pd.DataFrame]:
@@ -865,6 +534,34 @@ def _analyze_chart_api(
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/split-status")
+def get_split_status() -> Dict[str, Any]:
+    """獲取最後一次分割的狀態資訊"""
+    global _last_split_output_folder
+    
+    if _last_split_output_folder and os.path.exists(_last_split_output_folder):
+        # 計算資料夾中的 CSV 檔案數量
+        try:
+            csv_files = [f for f in os.listdir(_last_split_output_folder) if f.endswith('.csv')]
+            file_count = len(csv_files)
+        except Exception:
+            file_count = 0
+        
+        return {
+            "has_split_data": True,
+            "split_folder": _last_split_output_folder,
+            "csv_file_count": file_count,
+            "folder_exists": True
+        }
+    else:
+        return {
+            "has_split_data": False,
+            "split_folder": None,
+            "csv_file_count": 0,
+            "folder_exists": False
+        }
 
 
 @app.post("/process", response_model=ProcessResponse)
@@ -1143,8 +840,15 @@ def _split_type2_vertical(input_path: str, final_output_folder: str) -> bool:
 
 @app.post("/split")
 def split_csvs(req: SplitRequest) -> Dict[str, Any]:
-    final_output_folder = os.path.join(req.output_folder, "raw_charts")
+    global _last_split_output_folder
+    
+    # 使用預設輸出資料夾如果未指定
+    base_output_folder = req.output_folder or "input"
+    final_output_folder = os.path.join(base_output_folder, "raw_charts")
+    
+    # 確保輸出資料夾存在
     os.makedirs(final_output_folder, exist_ok=True)
+    
     successes = 0
     failures: List[str] = []
     for path in req.input_files:
@@ -1158,11 +862,17 @@ def split_csvs(req: SplitRequest) -> Dict[str, Any]:
         else:
             failures.append(os.path.basename(path))
 
+    # 如果處理成功，記住這個資料夾路徑
+    if successes > 0:
+        _last_split_output_folder = os.path.abspath(final_output_folder)
+        print(f"[Info] Split completed. Remembered output folder: {_last_split_output_folder}")
+
     return {
         "mode": req.mode,
         "output_folder": os.path.abspath(final_output_folder),
         "processed": successes,
         "failed": failures,
+        "remembered_for_oob": successes > 0,
     }
 
 
@@ -1685,7 +1395,355 @@ def root() -> Dict[str, Any]:
         },
     }
 
+def calculate_cpk_dashboard(raw_df: pd.DataFrame, chart_info: dict) -> dict:
+    """計算CPK指標，支援三種特性類型"""
+    if raw_df.empty:
+        return {'Cpk': None}
+    
+    mean = raw_df['point_val'].mean()
+    std = raw_df['point_val'].std()
+    characteristic = chart_info.get('Characteristics', '')
+    usl = chart_info.get('USL', None)
+    lsl = chart_info.get('LSL', None)
+    
+    cpk = None
+    if std > 0:
+        if characteristic == 'Nominal':
+            if usl is not None and lsl is not None:
+                cpu = (usl - mean) / (3 * std)
+                cpl = (mean - lsl) / (3 * std)
+                cpk = min(cpu, cpl)
+        elif characteristic in ['Smaller', 'Sigma']:
+            if usl is not None:
+                cpk = (usl - mean) / (3 * std)
+        elif characteristic == 'Bigger':
+            if lsl is not None:
+                cpk = (mean - lsl) / (3 * std)
+    
+    if cpk is not None:
+        cpk = round(cpk, 3)
+    return {'Cpk': cpk}
 
+
+def compute_cpk_windows(raw_df: pd.DataFrame, chart_info: dict, end_time: pd.Timestamp) -> dict:
+    """計算多時間窗口的CPK值"""
+    result = {'Cpk': None, 'Cpk_last_month': None, 'Cpk_last2_month': None}
+    
+    if raw_df is None or raw_df.empty:
+        return result
+    
+    if 'point_time' not in raw_df.columns:
+        result['Cpk'] = calculate_cpk_dashboard(raw_df, chart_info)['Cpk']
+        return result
+    
+    df = raw_df.copy()
+    df['point_time'] = pd.to_datetime(df['point_time'])
+    df = df[df['point_time'] <= end_time]
+    
+    if df.empty:
+        return result
+    
+    start1 = end_time - pd.DateOffset(months=1)
+    start2 = end_time - pd.DateOffset(months=2) 
+    start3 = end_time - pd.DateOffset(months=3)
+    
+    mask1 = (df['point_time'] > start1) & (df['point_time'] <= end_time)
+    mask2 = (df['point_time'] > start2) & (df['point_time'] <= start1)
+    mask3 = (df['point_time'] > start3) & (df['point_time'] <= start2)
+    
+    if mask1.any():
+        result['Cpk'] = calculate_cpk_dashboard(df[mask1], chart_info)['Cpk']
+    if mask2.any():
+        result['Cpk_last_month'] = calculate_cpk_dashboard(df[mask2], chart_info)['Cpk']
+    if mask3.any():
+        result['Cpk_last2_month'] = calculate_cpk_dashboard(df[mask3], chart_info)['Cpk']
+    
+    return result
+
+
+def generate_spc_chart_base64(raw_df: pd.DataFrame, chart_info: dict, 
+                             start_date: Optional[date] = None, 
+                             end_date: Optional[date] = None, 
+                             custom_mode: bool = False) -> str:
+    """生成SPC圖表並返回base64編碼"""
+    fig = plt.figure(figsize=(12, 6))
+    
+    # 創建GridSpec布局
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(2, 2, width_ratios=[3, 1], height_ratios=[1, 1], 
+                          hspace=0.3, wspace=0.25)
+    
+    # 主SPC圖
+    ax_main = fig.add_subplot(gs[:, 0])
+    ax_box = fig.add_subplot(gs[0, 1])  # Box Plot
+    ax_qq = fig.add_subplot(gs[1, 1])   # QQ Plot
+    
+    if raw_df is None or raw_df.empty:
+        ax_main.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_main.transAxes)
+        ax_box.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_box.transAxes)
+        ax_qq.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax_qq.transAxes)
+    else:
+        plot_df = raw_df.copy()
+        
+        # 日期過濾
+        if start_date and end_date and 'point_time' in plot_df.columns:
+            try:
+                plot_df['point_time'] = pd.to_datetime(plot_df['point_time'])
+                start_ts = pd.to_datetime(start_date)
+                end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+                filtered = plot_df[(plot_df['point_time'] >= start_ts) & (plot_df['point_time'] <= end_ts)]
+                if not filtered.empty:
+                    plot_df = filtered
+            except Exception:
+                pass
+        
+        if not plot_df.empty:
+            # 繪製主SPC圖
+            _draw_main_spc_chart_api(ax_main, plot_df, chart_info, start_date, end_date, custom_mode)
+            # 繪製Box Plot
+            _draw_box_plot_api(ax_box, plot_df, chart_info)
+            # 繪製QQ Plot
+            _draw_qq_plot_api(ax_qq, plot_df, chart_info)
+    
+    # 設置標題
+    group_name = chart_info.get('GroupName', '')
+    chart_name = chart_info.get('ChartName', '')
+    characteristics = chart_info.get('Characteristics', '')
+    ax_main.set_title(f"{group_name}@{chart_name}@{characteristics}", pad=18, fontsize=12)
+    
+    # Box Plot標題
+    if raw_df is not None and 'EQP_id' in raw_df.columns and not raw_df['EQP_id'].isna().all():
+        ax_box.set_title("Box Plot (by EQP_id)", fontsize=10)
+    else:
+        ax_box.set_title("Box Plot", fontsize=10)
+    
+    ax_qq.set_title("Q-Q Plot", fontsize=10)
+    
+    fig.tight_layout()
+    
+    # 轉換為base64
+    buffer = BytesIO()
+    fig.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
+    buffer.seek(0)
+    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    plt.close(fig)
+    
+    return image_base64
+
+
+def _draw_main_spc_chart_api(ax, plot_df, chart_info, start_date, end_date, custom_mode):
+    """繪製主要的SPC控制圖"""
+    y = plot_df['point_val'].values
+    x = range(1, len(y) + 1)
+    
+    # 等距模式處理時間排序
+    if 'point_time' in plot_df.columns:
+        try:
+            plot_df = plot_df.sort_values('point_time').reset_index(drop=True)
+            y = plot_df['point_val'].values
+        except Exception:
+            pass
+    
+    # 標示時間區間
+    if 'point_time' in plot_df.columns and not plot_df.empty:
+        try:
+            times = pd.to_datetime(plot_df['point_time']).to_numpy()
+            tmin, tmax = times.min(), times.max()
+            
+            if custom_mode and start_date and end_date:
+                # 自訂模式：顯示自訂範圍
+                start_time = pd.to_datetime(start_date)
+                end_time = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+                windows = [(start_time, end_time, 'Custom', '#dbeafe')]
+            else:
+                # 原本邏輯：三個月窗口
+                end_sel = pd.to_datetime(end_date) if end_date else pd.Timestamp(tmax)
+                if end_sel > pd.Timestamp(tmax):
+                    end_sel = pd.Timestamp(tmax)
+                start1 = end_sel - pd.DateOffset(months=1)
+                start2 = end_sel - pd.DateOffset(months=2)
+                start3 = end_sel - pd.DateOffset(months=3)
+                windows = [
+                    (start1, end_sel, 'L0', '#dbeafe'),
+                    (start2, start1, 'L1', '#fef9c3'),
+                    (start3, start2, 'L2', '#ede9fe'),
+                ]
+            
+            text_trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+            n = len(times)
+            
+            def t2ix_left(t):
+                return float(np.searchsorted(times, np.datetime64(t), side='left')) + 0.5
+            def t2ix_right(t):
+                return float(np.searchsorted(times, np.datetime64(t), side='right')) + 0.5
+            
+            x_min, x_max = 0.5, n + 0.5
+            for s, e, lab, col in windows:
+                s_clip = max(pd.Timestamp(s), pd.Timestamp(tmin))
+                e_clip = min(pd.Timestamp(e), pd.Timestamp(tmax))
+                if e_clip <= s_clip:
+                    continue
+                xl = max(x_min, t2ix_left(s_clip))
+                xr = min(x_max, t2ix_right(e_clip))
+                if xr <= xl:
+                    continue
+                ax.axvspan(xl, xr, color=col, alpha=0.25, zorder=0)
+                x_center = (xl + xr) / 2.0
+                ax.text(x_center, 1.04, lab, transform=text_trans, ha='center', va='top', 
+                       fontsize=8, color='#374151', alpha=0.9)
+        except Exception:
+            pass
+    
+    # 繪製資料點和線
+    ax.plot(x, y, linestyle='-', marker='o', color='#2563eb', markersize=4, linewidth=1.0)
+    
+    # 取得控制限
+    usl = chart_info.get('USL', None)
+    lsl = chart_info.get('LSL', None)
+    target = None
+    for key_t in ['Target', 'TARGET', 'TargetValue', '中心線', 'Center']:
+        if key_t in chart_info and pd.notna(chart_info.get(key_t)):
+            target = chart_info[key_t]
+            break
+    
+    mean_val = float(np.mean(y)) if len(y) else None
+    
+    # 標示超規點
+    if usl is not None:
+        ax.scatter([xi for xi, yi in zip(x, y) if yi > usl], 
+                  [yi for yi in y if yi > usl], 
+                  color='#dc2626', s=25, zorder=5)
+    if lsl is not None:
+        ax.scatter([xi for xi, yi in zip(x, y) if yi < lsl], 
+                  [yi for yi in y if yi < lsl], 
+                  color='#dc2626', marker='s', s=25, zorder=5)
+    
+    # 計算Y軸範圍
+    extra_vals = [v for v in [usl, lsl, target, mean_val] 
+                  if v is not None and not (isinstance(v, float) and np.isnan(v))]
+    if len(y) > 0:
+        ymin_sel = float(np.min(y))
+        ymax_sel = float(np.max(y))
+    else:
+        ymin_sel, ymax_sel = (0.0, 1.0)
+    if extra_vals:
+        ymin_sel = min(ymin_sel, min(extra_vals))
+        ymax_sel = max(ymax_sel, max(extra_vals))
+    rng = ymax_sel - ymin_sel
+    margin = 0.05 * rng if rng > 0 else 1.0
+    ax.set_ylim(ymin_sel - margin, ymax_sel + margin)
+    
+    # 繪製控制線
+    trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+    
+    def segment_with_label(val, name, color, va='center'):
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return
+        x0, x1 = 0.0, 0.96
+        ax.plot([x0, x1], [val, val], transform=trans, color=color, linestyle='--', linewidth=1.0)
+        ax.text(x1, val, name, transform=trans, color=color, va=va, ha='left', fontsize=8)
+    
+    segment_with_label(usl, 'USL', '#ef4444', va='center')
+    segment_with_label(lsl, 'LSL', '#ef4444', va='center')
+    segment_with_label(target, 'Target', '#f59e0b', va='center')
+    segment_with_label(mean_val, 'Mean', '#16a34a', va='center')
+    
+    # X軸刻度
+    if 'point_time' in plot_df.columns and not plot_df.empty:
+        times = plot_df['point_time'].tolist()
+        total = len(times)
+        if total <= 8:
+            tick_idx = list(range(1, total + 1))
+        else:
+            step = max(1, total // 6)
+            tick_idx = list(range(1, total + 1, step))
+            if tick_idx[-1] != total:
+                tick_idx.append(total)
+        labels = [times[i-1].strftime('%Y-%m-%d') for i in tick_idx]
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels(labels, rotation=30, ha='right', fontsize=8)
+    
+    ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.5)
+
+
+def _draw_box_plot_api(ax, plot_df, chart_info):
+    """繪製箱型圖"""
+    if plot_df.empty:
+        ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
+        return
+    
+    # 檢查是否有EQP_id欄位
+    if 'EQP_id' in plot_df.columns and not plot_df['EQP_id'].isna().all():
+        # 按EQP_id分組
+        grouped = plot_df.groupby('EQP_id')
+        eqp_ids = list(grouped.groups.keys())
+        
+        box_data = []
+        labels = []
+        
+        for eqp_id in sorted(eqp_ids):
+            group_data = grouped.get_group(eqp_id)['point_val'].values
+            if len(group_data) > 0:
+                box_data.append(group_data)
+                labels.append(str(eqp_id))
+        
+        if len(box_data) == 0:
+            ax.text(0.5, 0.5, "No Valid Data", ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        box_plot = ax.boxplot(box_data, patch_artist=True, notch=False)
+        
+        # 設定顏色
+        colors = ['#87CEEB', '#98FB98', '#FFB6C1', '#F0E68C', '#DDA0DD', '#F5DEB3', '#B0E0E6']
+        for i, patch in enumerate(box_plot['boxes']):
+            patch.set_facecolor(colors[i % len(colors)])
+            patch.set_alpha(0.8)
+        
+        ax.set_xticklabels(labels, rotation=0, ha='center', fontsize=9)
+        ax.set_xlabel('')
+    else:
+        # 單一box plot
+        y = plot_df['point_val'].values
+        if len(y) == 0:
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        box_plot = ax.boxplot(y, patch_artist=True, notch=False)
+        box_plot['boxes'][0].set_facecolor('#87CEEB')
+        box_plot['boxes'][0].set_alpha(0.8)
+        
+        ax.set_xticks([])
+        ax.set_xlabel('')
+
+
+def _draw_qq_plot_api(ax, plot_df, chart_info):
+    """繪製Q-Q圖"""
+    y = plot_df['point_val'].values
+    if len(y) == 0:
+        ax.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax.transAxes)
+        return
+    
+    try:
+        # 計算Q-Q plot資料
+        (osm, osr), (slope, intercept, r) = stats.probplot(y, dist="norm", plot=None)
+        
+        # 繪製資料點
+        ax.scatter(osm, osr, alpha=0.7, color='blue', s=20)
+        
+        # 繪製理論線
+        line_x = np.array([osm.min(), osm.max()])
+        line_y = slope * line_x + intercept
+        ax.plot(line_x, line_y, 'r-', linewidth=1.5, alpha=0.8, label=f'R²={r**2:.3f}')
+        
+        ax.set_xlabel('Theoretical Quantiles', fontsize=8)
+        ax.set_ylabel('Sample Quantiles', fontsize=8)
+        ax.grid(True, linestyle=':', linewidth=0.6, alpha=0.3)
+        ax.tick_params(axis='both', which='major', labelsize=8)
+        ax.legend(fontsize=7, loc='lower right')
+        
+    except Exception as e:
+        ax.text(0.5, 0.5, f"Calculation Error:\n{str(e)}", ha='center', va='center',
+               transform=ax.transAxes, fontsize=8)
 @app.post("/spc-cpk", response_model=SPCCpkResponse)
 def analyze_spc_cpk(request: SPCCpkRequest) -> SPCCpkResponse:
     """
@@ -1695,7 +1753,7 @@ def analyze_spc_cpk(request: SPCCpkRequest) -> SPCCpkResponse:
     - 生成 SPC 控制圖、Box Plot、Q-Q Plot
     - 可匯出 Excel 詳細報告
     """
-    # 設定預設路徑
+    # 設定預設路徑 - 使用統一的 _default_paths 函數
     defaults = _default_paths()
     chart_excel_path = request.chart_excel_path or defaults["chart_excel_path"]
     raw_data_directory = request.raw_data_directory or defaults["raw_data_directory"]
@@ -2068,7 +2126,7 @@ def _export_spc_cpk_to_excel(chart_results: List[SPCChartInfo], summary: dict, s
         worksheet = workbook.add_worksheet()
         
         # 設定欄寬
-        worksheet.set_column(0, 0, 120)  # 圖片欄位寬度調整為 120
+        worksheet.set_column(0, 0, 100)  # 圖片欄位寬度調整為 120
         for i in range(1, len(columns)):
             worksheet.set_column(i, i, 15)  # 其他欄位寬度調整為 15
         
@@ -2079,20 +2137,17 @@ def _export_spc_cpk_to_excel(chart_results: List[SPCChartInfo], summary: dict, s
         # 寫入標題
         for col_idx, col_name in enumerate(columns):
             worksheet.write(0, col_idx, col_name, bold)
-        
-        # 寫入資料和圖片
-        img_width = 120
-        img_height = 80  # 降低圖片高度，讓圖片看起來更扁
+
         
         for row_idx, (row_data, img_path) in enumerate(zip(df.to_dict('records'), chart_images), 1):
             # 插入圖片
             if img_path and os.path.exists(img_path):
                 worksheet.set_row(row_idx, 200)  # 行高調整為 200
                 worksheet.insert_image(row_idx, 0, img_path, {
-                    'x_scale': 1.0,  # 水平保持原始大小
-                    'y_scale': 0.6,  # 垂直縮放為 60%，讓圖片變扁
+                    'x_scale': 0.6,  # 水平保持原始大小
+                    'y_scale': 0.4,  # 垂直縮放為 60%，讓圖片變扁
                     'object_position': 1,
-                    'y_offset': 15
+                    'y_offset': 10
                 })
             
             # 寫入其他欄位
