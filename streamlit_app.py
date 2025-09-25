@@ -158,95 +158,101 @@ def display_chart_images_vertical(chart_result: dict, location: str = "vertical"
     """上下排列顯示兩張圖片，用於表格旁的互動區域
     
     Args:
-        chart_result: 圖表結果數據
+        chart_result: chart結果數據
         location: 顯示位置標識
     """
     chart_path = chart_result.get('chart_path')
     weekly_chart_path = chart_result.get('weekly_chart_path')
     
-    # SPC 圖表（上方）
+    # SPC chart（上方）
     if chart_path and os.path.exists(chart_path):
         try:
             # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
             st.image(chart_path, caption="SPC Chart")
         except Exception as e:
-            st.error(f"無法載入 SPC 圖表: {e}")
+            st.error(f"無法載入 SPC chart: {e}")
     else:
-        st.info("SPC 圖表未生成")
+        st.info("SPC chart未生成")
     
     # 小間距
     st.markdown("<div style='height: 30px;'></div>", unsafe_allow_html=True)
     
-    # Weekly SPC 圖表（下方）
+    # Weekly SPC chart（下方）
     if weekly_chart_path and os.path.exists(weekly_chart_path):
         try:
             # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
             st.image(weekly_chart_path, caption="Weekly SPC Chart")
         except Exception as e:
-            st.error(f"無法載入 Weekly SPC 圖表: {e}")
+            st.error(f"無法載入 Weekly SPC chart: {e}")
     else:
-        st.info("Weekly SPC 圖表未生成")
+        st.info("Weekly SPC chart未生成")
 
 def display_chart_images_fullwidth(chart_result: dict, index: int = 0, location: str = "main"):
-    """全寬度顯示單個圖表結果的兩張圖片和違規規則詳情
+    """全寬度顯示單個chart結果的兩張圖片和違規規則詳情
     
     Args:
-        chart_result: 圖表結果數據
-        index: 圖表索引
+        chart_result: chart結果數據
+        index: chart索引
         location: 顯示位置標識（main, table_selection, etc.）
     """
     chart_path = chart_result.get('chart_path')
     weekly_chart_path = chart_result.get('weekly_chart_path')
     
     if chart_path or weekly_chart_path:
-        # 圖表資訊標題
+        # chart資訊標題
         chart_name = f"{chart_result.get('group_name', 'Unknown')} - {chart_result.get('chart_name', 'Unknown')}"
         st.markdown(f"### 📊 {chart_name}")
         
-        # 使用三欄佈局：左邊兩欄顯示圖表，右邊一欄顯示違規詳情
+        # 使用三欄佈局：左邊兩欄顯示chart，右邊一欄顯示違規詳情
         col1, col2, col3 = st.columns([2, 2, 1], gap="medium")
         
         with col1:
             if chart_path and os.path.exists(chart_path):
-                st.markdown("#### 📈 SPC 圖表")
+                st.markdown("#### 📈 SPC chart")
                 try:
                     # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
                     st.image(chart_path, caption="SPC Chart")
                     
-                    # 提供單張圖片下載
-                    with open(chart_path, "rb") as f:
-                        st.download_button(
-                            label="📥 下載 SPC 圖表",
-                            data=f.read(),
-                            file_name=os.path.basename(chart_path),
-                            mime="image/png",
-                            key=f"download_spc_{location}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}"
-                        )
+                    # 提供單張圖片下載 - 置中顯示
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+                    with col_btn2:
+                        with open(chart_path, "rb") as f:
+                            st.download_button(
+                                label="📥 下載 SPC chart",
+                                data=f.read(),
+                                file_name=os.path.basename(chart_path),
+                                mime="image/png",
+                                key=f"download_spc_{location}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}",
+                                use_container_width=True
+                            )
                 except Exception as e:
-                    st.error(f"無法載入 SPC 圖表: {e}")
+                    st.error(f"無法載入 SPC chart: {e}")
             else:
-                st.info("SPC 圖表未生成")
+                st.info("SPC chart未生成")
         
         with col2:
             if weekly_chart_path and os.path.exists(weekly_chart_path):
-                st.markdown("#### 📅 Weekly SPC 圖表")
+                st.markdown("#### 📅 Weekly SPC chart")
                 try:
                     # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
                     st.image(weekly_chart_path, caption="Weekly SPC Chart")
                     
-                    # 提供單張圖片下載
-                    with open(weekly_chart_path, "rb") as f:
-                        st.download_button(
-                            label="📥 下載 Weekly SPC 圖表",
-                            data=f.read(),
-                            file_name=os.path.basename(weekly_chart_path),
-                            mime="image/png",
-                            key=f"download_weekly_{location}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}"
-                        )
+                    # 提供單張圖片下載 - 置中顯示
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+                    with col_btn2:
+                        with open(weekly_chart_path, "rb") as f:
+                            st.download_button(
+                                label="📥 下載 Weekly SPC chart",
+                                data=f.read(),
+                                file_name=os.path.basename(weekly_chart_path),
+                                mime="image/png",
+                                key=f"download_weekly_{location}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}",
+                                use_container_width=True
+                            )
                 except Exception as e:
-                    st.error(f"無法載入 Weekly SPC 圖表: {e}")
+                    st.error(f"無法載入 Weekly SPC chart: {e}")
             else:
-                st.info("Weekly SPC 圖表未生成")
+                st.info("Weekly SPC chart未生成")
         
         with col3:
             # 顯示違規規則詳情
@@ -293,7 +299,7 @@ def display_chart_images_fullwidth(chart_result: dict, index: int = 0, location:
         st.markdown("---")
 
 def display_chart_images(chart_result: dict, index: int = 0):
-    """顯示單個圖表結果的兩張圖片"""
+    """顯示單個chart結果的兩張圖片"""
     chart_path = chart_result.get('chart_path')
     weekly_chart_path = chart_result.get('weekly_chart_path')
     
@@ -302,45 +308,51 @@ def display_chart_images(chart_result: dict, index: int = 0):
         
         with col1:
             if chart_path and os.path.exists(chart_path):
-                st.write("**SPC 圖表**")
+                st.write("**SPC chart**")
                 try:
                     # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
                     st.image(chart_path, caption="SPC Chart")
                     
-                    # 提供單張圖片下載
-                    with open(chart_path, "rb") as f:
-                        st.download_button(
-                            label="📥 下載 SPC 圖表",
-                            data=f.read(),
-                            file_name=os.path.basename(chart_path),
-                            mime="image/png",
-                            key=f"download_spc_{index}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}"
-                        )
+                    # 提供單張圖片下載 - 置中顯示
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+                    with col_btn2:
+                        with open(chart_path, "rb") as f:
+                            st.download_button(
+                                label="📥 下載 SPC chart",
+                                data=f.read(),
+                                file_name=os.path.basename(chart_path),
+                                mime="image/png",
+                                key=f"download_spc_{index}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}",
+                                use_container_width=True
+                            )
                 except Exception as e:
-                    st.error(f"無法載入 SPC 圖表: {e}")
+                    st.error(f"無法載入 SPC chart: {e}")
             else:
-                st.info("SPC 圖表未生成")
+                st.info("SPC chart未生成")
         
         with col2:
             if weekly_chart_path and os.path.exists(weekly_chart_path):
-                st.write("**Weekly SPC 圖表**")
+                st.write("**Weekly SPC chart**")
                 try:
                     # 直接使用圖檔路徑，不做任何處理，以原始尺寸顯示
                     st.image(weekly_chart_path, caption="Weekly SPC Chart")
                     
-                    # 提供單張圖片下載
-                    with open(weekly_chart_path, "rb") as f:
-                        st.download_button(
-                            label="📥 下載 Weekly SPC 圖表",
-                            data=f.read(),
-                            file_name=os.path.basename(weekly_chart_path),
-                            mime="image/png",
-                            key=f"download_weekly_{index}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}"
-                        )
+                    # 提供單張圖片下載 - 置中顯示
+                    col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
+                    with col_btn2:
+                        with open(weekly_chart_path, "rb") as f:
+                            st.download_button(
+                                label="📥 下載 Weekly SPC chart",
+                                data=f.read(),
+                                file_name=os.path.basename(weekly_chart_path),
+                                mime="image/png",
+                                key=f"download_weekly_{index}_{chart_result.get('group_name', 'unknown')}_{chart_result.get('chart_name', 'unknown')}",
+                                use_container_width=True
+                            )
                 except Exception as e:
-                    st.error(f"無法載入 Weekly SPC 圖表: {e}")
+                    st.error(f"無法載入 Weekly SPC chart: {e}")
             else:
-                st.info("Weekly SPC 圖表未生成")
+                st.info("Weekly SPC chart未生成")
 
 def render_file_uploader_with_filter(key: str, accept_multiple_files: bool = False, file_types: list = None, title: str = "選擇檔案"):
     """帶篩選功能的檔案上傳元件"""
@@ -438,7 +450,7 @@ def render_split_chart_page():
         return
     
     st.markdown("## 📊 CSV 檔案分割工具")
-    st.markdown("將複合格式的 CSV 檔案分割成個別圖表的獨立檔案，方便後續的 SPC 分析處理。")
+    st.markdown("將複合格式的 CSV 檔案分割成個別chart的獨立檔案，方便後續的 SPC 分析處理。")
     
     # 分割模式選擇
     col1, col2 = st.columns([0.8, 1])
@@ -449,7 +461,7 @@ def render_split_chart_page():
         split_mode = st.selectbox(
             "選擇分割模式",
             ["Type3_Horizontal", "Type2_Vertical"],
-            help="Type3_Horizontal: 橫向資料格式，多個圖表在不同欄位\nType2_Vertical: 縱向資料格式，所有圖表在同一檔案透過 GroupName 和 ChartName 區分"
+            help="Type3_Horizontal: 橫向資料格式，多個chart在不同欄位\nType2_Vertical: 縱向資料格式，所有chart在同一檔案透過 GroupName 和 ChartName 區分"
         )
         
         # 輸出資料夾設定（暫時關閉）
@@ -505,7 +517,7 @@ def render_split_chart_page():
         st.markdown("""
         **Type3_Horizontal (橫向分割)**
         - 適用於橫向資料格式
-        - 多個圖表的資料在同一檔案的不同欄位
+        - 多個chart的資料在同一檔案的不同欄位
         - 前兩行作為複合標題處理
         - 需要包含 'GroupName' 和 'ChartName' 的欄位
         """)
@@ -514,8 +526,8 @@ def render_split_chart_page():
         st.markdown("""
         **Type2_Vertical (縱向分割)**
         - 適用於縱向資料格式
-        - 所有圖表資料在同一檔案
-        - 透過 GroupName 和 ChartName 區分不同圖表
+        - 所有chart資料在同一檔案
+        - 透過 GroupName 和 ChartName 區分不同chart
         - 需要標準欄位：GroupName、ChartName、point_time、point_val
         """)
     
@@ -685,7 +697,7 @@ def render_oob_page():
     
     with col_header2:
         # 置中的標題區
-        st.markdown("<div style='text-align: center; padding: 20px;'><h3>� OOB/SPC 分析系統</h3></div>", 
+        st.markdown("<div style='text-align: center; padding: 20px;'><h3>OOB/SPC 分析系統</h3></div>", 
                    unsafe_allow_html=True)
     
     with col_header3:
@@ -780,7 +792,7 @@ def render_oob_page():
         st.subheader("📊 分析摘要")
         col_metrics = st.columns(5)
         with col_metrics[0]:
-            st.metric("總圖表數", result['summary']['total_charts'])
+            st.metric("總chart數", result['summary']['total_charts'])
         with col_metrics[1]:
             st.metric("已處理", result['summary']['processed_charts'])
         with col_metrics[2]:
@@ -799,39 +811,40 @@ def render_oob_page():
                 with open(result['summary']['excel_output'], "rb") as f:
                     excel_data = f.read()
                 
-                col_download = st.columns([1, 2, 1])
+                col_download = st.columns([1, 4, 1])
                 with col_download[1]:
                     st.download_button(
                         label="📊 下載 Excel 報告",
                         data=excel_data,
                         file_name=f"oob_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
                     )
             else:
                 st.warning("⚠️ 無 Excel 報告可供下載")
         
-        # 顯示圖表（如果有）- 全寬度顯示
+        # 顯示chart（如果有）- 全寬度顯示
         chart_results = [r for r in result['results'] if r.get('chart_path') or r.get('weekly_chart_path')]
         if chart_results:
-            st.subheader("📊 生成的圖表")
+            st.subheader("📊 生成的chart")
             
-            # 添加圖表篩選功能
+            # 添加chart篩選功能
             if len(chart_results) > 5:
-                st.markdown("##### 🔍 圖表篩選")
+                st.markdown("##### 🔍 chart篩選")
                 filter_col1, filter_col2 = st.columns([3, 2])
                 
                 with filter_col1:
-                    chart_filter = st.text_input("篩選圖表名稱", placeholder="輸入關鍵字篩選圖表...", key="chart_result_filter")
+                    chart_filter = st.text_input("篩選chart名稱", placeholder="輸入關鍵字篩選chart...", key="chart_result_filter")
                 with filter_col2:
                     # 準備下拉選項
                     chart_names = [f"{r.get('group_name', 'Unknown')} - {r.get('chart_name', 'Unknown')}" 
                                  for r in chart_results]
-                    chart_names.insert(0, "全部圖表")  # 添加「全部」選項
+                    chart_names.insert(0, "全部chart")  # 添加「全部」選項
                     
-                    selected_chart = st.selectbox("選擇特定圖表", chart_names, key="chart_selector")
+                    selected_chart = st.selectbox("選擇特定chart", chart_names, key="chart_selector")
                 
-                # 篩選圖表結果
-                if selected_chart and selected_chart != "全部圖表":
+                # 篩選chart結果
+                if selected_chart and selected_chart != "全部chart":
                     # 使用下拉選擇的結果
                     selected_index = chart_names.index(selected_chart) - 1  # 減1因為第0個是「全部」
                     filtered_chart_results = [chart_results[selected_index]]
@@ -843,14 +856,14 @@ def render_oob_page():
                         or chart_filter.lower() in r.get('chart_name', '').lower()
                     ]
                 else:
-                    # 預設顯示所有圖表
+                    # 預設顯示所有chart
                     filtered_chart_results = chart_results
             else:
                 filtered_chart_results = chart_results
             
-            # 使用 tabs 來組織多個圖表，讓圖表占據更多空間
+            # 使用 tabs 來組織多個chart，讓chart占據更多空間
             if len(filtered_chart_results) > 1:
-                # 為每個圖表組合創建一個 tab
+                # 為每個chart組合創建一個 tab
                 tab_names = [f"{r.get('group_name', 'Unknown')}_{r.get('chart_name', 'Unknown')}" 
                            for r in filtered_chart_results]
                 tabs = st.tabs(tab_names)
@@ -859,24 +872,24 @@ def render_oob_page():
                     with tab:
                         display_chart_images_fullwidth(chart_result, i, "main_tabs")
             else:
-                # 只有一組圖表時直接顯示
+                # 只有一組chart時直接顯示
                 if filtered_chart_results:
                     display_chart_images_fullwidth(filtered_chart_results[0], 0, "main_single")
         
         # 詳細結果表格
         if result['results']:
-            # 使用兩欄佈局：左邊表格標題，右邊互動圖表標題
+            # 使用兩欄佈局：左邊表格標題，右邊互動chart標題
             title_col1, title_col2 = st.columns([3, 2])  # 3:2 的比例
             
             with title_col1:
                 st.subheader("📋 詳細結果表格")
             with title_col2:
-                st.subheader("🎯 互動圖表區域")
+                st.subheader("🎯 互動chart區域")
             
             # 轉換為 DataFrame（使用 .copy() 避免警告）
             df_results = pd.DataFrame(result['results']).copy()
             
-            # 使用兩欄佈局：左邊表格，右邊互動圖表
+            # 使用兩欄佈局：左邊表格，右邊互動chart
             table_col, chart_col = st.columns([3, 2])  # 3:2 的比例
             
             with table_col:
@@ -954,7 +967,7 @@ def render_oob_page():
                             st.session_state['selected_chart_data'] = None
                     else:
                         # 回退到標準 dataframe
-                        st.info("💡 提示：點擊表格行可查看對應圖表")
+                        st.info("💡 提示：點擊表格行可查看對應chart")
                         
                         event = st.dataframe(
                             filtered_df[available_columns],
@@ -979,7 +992,7 @@ def render_oob_page():
                 # 檢查是否有選擇的項目
                 selected_chart_data = st.session_state.get('selected_chart_data')
                 if selected_chart_data:
-                    # 找到對應的圖表結果
+                    # 找到對應的chart結果
                     matching_chart = None
                     for chart_result in chart_results:
                         if (chart_result.get('group_name') == selected_chart_data.get('group_name') and
@@ -991,9 +1004,9 @@ def render_oob_page():
                         # 使用新的上下排列顯示函數
                         display_chart_images_vertical(matching_chart, "table_interactive")
                     else:
-                        st.info("💡 選中的項目沒有對應的圖表")
+                        st.info("💡 選中的項目沒有對應的chart")
                 else:
-                    st.info("� 點擊表格中的任意行來查看對應圖表")
+                    st.info("� 點擊表格中的任意行來查看對應chart")
     else:
         # 空狀態顯示
         st.markdown("""
@@ -1060,6 +1073,14 @@ def render_tool_matching_page():
                 param_col1, param_col2 = st.columns([1, 1])
                 
                 with param_col1:
+                    # 假的勾選框，保持佈局對稱
+                    st.checkbox(
+                        "自訂 Mean Index 門檻", 
+                        value=True,
+                        help="Mean Index 門檻設定（固定啟用）",
+                        disabled=True
+                    )
+                    
                     mean_threshold = st.number_input(
                         "Mean Index 門檻", 
                         min_value=0.1, 
@@ -1076,6 +1097,7 @@ def render_tool_matching_page():
                         help="勾選後可自訂固定門檻，否則使用各項目的K值（基於樣本數）"
                     )
                     
+                    # 保持固定高度，避免佈局跳動
                     if use_custom_sigma:
                         sigma_threshold = st.number_input(
                             "Sigma Index 門檻", 
@@ -1087,7 +1109,16 @@ def render_tool_matching_page():
                         )
                     else:
                         sigma_threshold = 2.0  # 預設值，實際會使用K值
-                        st.info("📊 將使用各項目的K值作為 Sigma Index 門檻（基於樣本數）")
+                        # 使用空的 number_input 佔位，保持高度一致
+                        st.number_input(
+                            "Sigma Index 門檻 (自動計算)", 
+                            min_value=0.1, 
+                            max_value=10.0, 
+                            value=2.0, 
+                            step=0.1,
+                            help="將使用各項目的K值作為門檻（基於樣本數）",
+                            disabled=True
+                        )
                 
                 use_statistical_test = False
                 statistical_method = "unpaired"
@@ -1223,7 +1254,7 @@ def render_tool_matching_page():
                             excel_data = f.read()
                         
                         st.download_button(
-                            label="� 下載 Excel 報告",
+                            label="下載 Excel 報告",
                             data=excel_data,
                             file_name=f"tool_matching_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -1354,7 +1385,7 @@ def render_tool_matching_page():
                     "🔍": "👁️" if is_abnormal or is_data_insufficient else "ℹ️",  # 視覺指示器
                     "異常類型": abnormal_type,
                     "群組名稱": gname,
-                    "圖表名稱": cname,
+                    "chart名稱": cname,
                     "匹配群組": group_id,
                     "Mean Index": format_value(mean_index),
                     "Sigma Index": format_value(sigma_index),
@@ -1526,13 +1557,13 @@ def render_spc_cpk_page():
             
             st.divider()
             
-            # 圖表選擇
-            st.write("**🎯 圖表選擇設定**")
+            # chart選擇
+            st.write("**🎯 chart選擇設定**")
             selected_chart = st.text_input(
-                "指定圖表 (可選)",
+                "指定chart (可選)",
                 value="",
                 placeholder="例如: GroupName - ChartName",
-                help="留空則分析所有圖表，或指定特定圖表進行分析"
+                help="留空則分析所有chart，或指定特定chart進行分析"
             )
     
     with col_header2:
@@ -1619,15 +1650,7 @@ def render_spc_cpk_results(results: dict):
     charts_data = results.get('charts', [])
     summary = results.get('summary', {})
     excel_path = results.get('excel_path')
-    
-    # 顯示分析摘要
-    st.subheader("📊 分析摘要")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("圖表總數", summary.get('total_charts', 0))
-    with col2:
-        st.metric("分析日期範圍", f"{summary.get('date_range', 'N/A')}")
+    # （摘要已移除，僅保留下載與詳細列表）
     
     # Excel 下載按鈕
     if excel_path:
@@ -1644,18 +1667,18 @@ def render_spc_cpk_results(results: dict):
             st.warning("Excel 檔案不存在或已被移動")
     
     if not charts_data:
-        st.warning("沒有找到圖表資料")
+        st.warning("沒有找到chart資料")
         return
     
     st.markdown("---")
     
-    # 圖表選擇器
-    st.subheader("🎯 圖表選擇")
+    # chart選擇器
+    st.subheader("🎯 chart選擇")
     chart_options = [f"{chart['group_name']} - {chart['chart_name']}" for chart in charts_data]
     
     if chart_options:
         selected_chart_idx = st.selectbox(
-            "選擇要檢視的圖表",
+            "選擇要檢視的chart",
             range(len(chart_options)),
             format_func=lambda x: chart_options[x],
             key="spc_chart_selector"
@@ -1667,15 +1690,15 @@ def render_spc_cpk_results(results: dict):
     
     st.markdown("---")
     
-    # 所有圖表的指標摘要表
-    st.subheader("📋 所有圖表 CPK 指標摘要")
+    # 所有chart的指標摘要表
+    st.subheader("📋 所有chart CPK 指標摘要")
     
     # 準備表格資料
     table_data = []
     for chart in charts_data:
         metrics = chart.get('metrics', {})
         table_data.append({
-            '圖表': f"{chart['group_name']} - {chart['chart_name']}",
+            'chart': f"{chart['group_name']} - {chart['chart_name']}",
             '特性': chart.get('characteristics', ''),
             'USL': chart.get('usl', ''),
             'LSL': chart.get('lsl', ''),
@@ -1700,7 +1723,7 @@ def render_spc_cpk_results(results: dict):
             gb.configure_default_column(groupable=True, value=True, enableRowGroup=True, aggFunc='sum', editable=False)
             
             # 設定欄位寬度
-            gb.configure_column("圖表", width=250, pinned="left")
+            gb.configure_column("chart", width=250, pinned="left")
             gb.configure_column("特性", width=120)
             
             gridOptions = gb.build()
@@ -1721,25 +1744,21 @@ def render_spc_cpk_results(results: dict):
 
 
 def render_single_spc_chart(chart_data: dict):
-    """渲染單一 SPC 圖表的詳細資訊"""
+    """渲染單一 SPC chart的詳細資訊"""
     st.subheader(f"📊 {chart_data['group_name']} - {chart_data['chart_name']}")
     
-    # 基本資訊
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.write(f"**特性**: {chart_data.get('characteristics', 'N/A')}")
-        st.write(f"**USL**: {chart_data.get('usl', 'N/A')}")
-    with col2:
-        st.write(f"**LSL**: {chart_data.get('lsl', 'N/A')}")
-        st.write(f"**Target**: {chart_data.get('target', 'N/A')}")
-    with col3:
-        st.write(f"**K 值**: {_format_metric_value(chart_data.get('metrics', {}).get('k_value'))}")
+    # 基本資訊改為字卡（不重複顯示 K 值，K 保留在下方 CPK 指標列）
+    info_cols = st.columns(4)
+    info_cols[0].metric("特性", chart_data.get('characteristics', 'N/A'))
+    info_cols[1].metric("USL", _format_metric_value(chart_data.get('usl')))
+    info_cols[2].metric("LSL", _format_metric_value(chart_data.get('lsl')))
+    info_cols[3].metric("Target", _format_metric_value(chart_data.get('target')))
     
     # CPK 指標卡片
     st.markdown("#### CPK 指標")
     metrics = chart_data.get('metrics', {})
     
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     with col1:
         cpk_val = _format_metric_value(metrics.get('cpk'))
         st.metric("Cpk (當月)", cpk_val)
@@ -1758,8 +1777,11 @@ def render_single_spc_chart(chart_data: dict):
     with col6:
         r2_val = _format_metric_value(metrics.get('r2'), is_percent=True)
         st.metric("R2", r2_val)
+    with col7:
+        k_val = _format_metric_value(metrics.get('k_value'))
+        st.metric("K 值", k_val)
     
-    # 顯示 SPC 圖表
+    # 顯示 SPC chart
     chart_image = chart_data.get('chart_image')
     if chart_image:
         st.markdown("#### SPC 控制圖")
@@ -1773,7 +1795,7 @@ def render_single_spc_chart(chart_data: dict):
             image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
             st.image(image, width='stretch')
         except Exception as e:
-            st.error(f"無法顯示圖表: {e}")
+            st.error(f"無法顯示chart: {e}")
     
     # 統計資訊表
     st.markdown("#### 統計資訊")
@@ -1821,7 +1843,7 @@ def main():
     init_session_state()
     
     # 標題和導航
-    st.title("📊 OOB & Tool Matching 分析系統")
+    st.title("OSAT SPC System")
     st.markdown("---")
     
     # 檢查 API 連線狀態

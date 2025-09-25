@@ -1426,38 +1426,85 @@ def calculate_cpk_dashboard(raw_df: pd.DataFrame, chart_info: dict) -> dict:
 
 
 def compute_cpk_windows(raw_df: pd.DataFrame, chart_info: dict, end_time: pd.Timestamp) -> dict:
-    """計算多時間窗口的CPK值"""
-    result = {'Cpk': None, 'Cpk_last_month': None, 'Cpk_last2_month': None}
-    
+    """計算多時間窗口的CPK值，同時計算各窗口 mean / sigma 以便直接輸出到 Excel。
+
+    回傳欄位：
+      - Cpk, Cpk_last_month, Cpk_last2_month
+      - mean_current, sigma_current
+      - mean_last_month, sigma_last_month
+      - mean_last2_month, sigma_last2_month
+    """
+    result = {
+        'Cpk': None,
+        'Cpk_last_month': None,
+        'Cpk_last2_month': None,
+        'mean_current': None,
+        'sigma_current': None,
+        'mean_last_month': None,
+        'sigma_last_month': None,
+        'mean_last2_month': None,
+        'sigma_last2_month': None,
+    }
+
     if raw_df is None or raw_df.empty:
         return result
-    
+
     if 'point_time' not in raw_df.columns:
-        result['Cpk'] = calculate_cpk_dashboard(raw_df, chart_info)['Cpk']
+        # 沒有時間欄位：只能算全期間 (視為 current)
+        sub_cpk = calculate_cpk_dashboard(raw_df, chart_info)['Cpk']
+        result['Cpk'] = sub_cpk
+        result['mean_current'] = raw_df['point_val'].mean()
+        result['sigma_current'] = raw_df['point_val'].std()
         return result
-    
+
     df = raw_df.copy()
-    df['point_time'] = pd.to_datetime(df['point_time'])
+    try:
+        df['point_time'] = pd.to_datetime(df['point_time'])
+    except Exception:
+        # 轉換失敗直接返回全期間統計
+        result['Cpk'] = calculate_cpk_dashboard(df, chart_info)['Cpk']
+        result['mean_current'] = df['point_val'].mean()
+        result['sigma_current'] = df['point_val'].std()
+        return result
+
+    # 限制截止時間
     df = df[df['point_time'] <= end_time]
-    
     if df.empty:
         return result
-    
+
     start1 = end_time - pd.DateOffset(months=1)
-    start2 = end_time - pd.DateOffset(months=2) 
+    start2 = end_time - pd.DateOffset(months=2)
     start3 = end_time - pd.DateOffset(months=3)
-    
+
+    # 原本條件為 (startX, end] 左開右閉，這裡保留；若需要含 start 請再調整 >=。
     mask1 = (df['point_time'] > start1) & (df['point_time'] <= end_time)
     mask2 = (df['point_time'] > start2) & (df['point_time'] <= start1)
     mask3 = (df['point_time'] > start3) & (df['point_time'] <= start2)
-    
+
+    # Current (L0)
     if mask1.any():
-        result['Cpk'] = calculate_cpk_dashboard(df[mask1], chart_info)['Cpk']
+        seg = df[mask1]
+        result['Cpk'] = calculate_cpk_dashboard(seg, chart_info)['Cpk']
+        result['mean_current'] = seg['point_val'].mean()
+        result['sigma_current'] = seg['point_val'].std()
+    # Last month (L1)
     if mask2.any():
-        result['Cpk_last_month'] = calculate_cpk_dashboard(df[mask2], chart_info)['Cpk']
+        seg = df[mask2]
+        result['Cpk_last_month'] = calculate_cpk_dashboard(seg, chart_info)['Cpk']
+        result['mean_last_month'] = seg['point_val'].mean()
+        result['sigma_last_month'] = seg['point_val'].std()
+    # Last 2 month (L2)
     if mask3.any():
-        result['Cpk_last2_month'] = calculate_cpk_dashboard(df[mask3], chart_info)['Cpk']
-    
+        seg = df[mask3]
+        result['Cpk_last2_month'] = calculate_cpk_dashboard(seg, chart_info)['Cpk']
+        result['mean_last2_month'] = seg['point_val'].mean()
+        result['sigma_last2_month'] = seg['point_val'].std()
+
+    # 數值清理：避免 Inf / NaN 造成 JSON 序列化錯誤
+    for k, v in list(result.items()):
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                result[k] = None
     return result
 
 
@@ -1863,9 +1910,20 @@ def analyze_spc_cpk(request: SPCCpkRequest) -> SPCCpkResponse:
                             r2=r2,
                             k_value=_calculate_k_value(raw_df, chart_info.to_dict(), start_date, end_date, request.custom_mode)
                         )
-                    
-                    # 計算統計值（各時段的 Mean, Sigma）
+
+                    # 先取得原本統計（保留既有邏輯），再用 cpk_res 的 mean/sigma 覆蓋缺失值
                     mean_stats = _calculate_period_statistics(raw_df, end_date, request.custom_mode, start_date)
+                    # 如果 compute_cpk_windows 有提供數值而 mean_stats 為 None，則填入
+                    for k_src, k_dst in [
+                        ('mean_current', 'mean_current'),
+                        ('sigma_current', 'sigma_current'),
+                        ('mean_last_month', 'mean_last_month'),
+                        ('sigma_last_month', 'sigma_last_month'),
+                        ('mean_last2_month', 'mean_last2_month'),
+                        ('sigma_last2_month', 'sigma_last2_month'),
+                    ]:
+                        if mean_stats.get(k_dst) is None and cpk_res.get(k_src) is not None:
+                            mean_stats[k_dst] = cpk_res[k_src]
                     
                     # 生成圖表
                     chart_image = generate_spc_chart_base64(raw_df, chart_info.to_dict(), 
@@ -1892,10 +1950,23 @@ def analyze_spc_cpk(request: SPCCpkRequest) -> SPCCpkResponse:
                 print(f"Raw data file not found for {group_name}/{chart_name}")
                 continue
         
-        # 生成摘要統計
+        # 生成摘要統計（擴充）
+        cpk_values = [c.metrics.cpk for c in chart_results if c.metrics.cpk is not None]
+        all_cpk_values = [c.metrics.custom_cpk for c in chart_results if c.metrics.custom_cpk is not None]
+        mean_curr_list = [c.mean_current for c in chart_results if c.mean_current is not None]
+        total_points_current = 0
+        total_points_all = 0
+        # 嘗試估算每個 current 視窗點數（需要 point_time，因此粗略重算）
+        # 為避免昂貴計算，僅在有 point_time 時做彙總
+        # （簡化：不額外讀檔，這裡略過細緻點數統計，只提供已計算欄位的聚合）
         summary = {
             "total_charts": len(chart_results),
-            "date_range": f"{start_date} to {end_date}",
+            "charts_with_cpk": len(cpk_values),
+            "avg_cpk": round(float(np.mean(cpk_values)), 4) if cpk_values else None,
+            "median_cpk": round(float(np.median(cpk_values)), 4) if cpk_values else None,
+            "avg_all_cpk": round(float(np.mean(all_cpk_values)), 4) if all_cpk_values else None,
+            "median_all_cpk": round(float(np.median(all_cpk_values)), 4) if all_cpk_values else None,
+            "charts_with_mean_current": len(mean_curr_list),
             "custom_mode": request.custom_mode,
             "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -1908,6 +1979,29 @@ def analyze_spc_cpk(request: SPCCpkRequest) -> SPCCpkResponse:
             except Exception as e:
                 print(f"Warning: Excel export failed: {e}")
         
+        # 最終輸出前再全域清理一次圖表中的 Inf/NaN，避免 JSON 失敗
+        def _sanitize_number(x):
+            if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+                return None
+            return x
+        for ch in chart_results:
+            ch.mean_current = _sanitize_number(ch.mean_current)
+            ch.sigma_current = _sanitize_number(ch.sigma_current)
+            ch.mean_last_month = _sanitize_number(ch.mean_last_month)
+            ch.sigma_last_month = _sanitize_number(ch.sigma_last_month)
+            ch.mean_last2_month = _sanitize_number(ch.mean_last2_month)
+            ch.sigma_last2_month = _sanitize_number(ch.sigma_last2_month)
+            ch.mean_all = _sanitize_number(ch.mean_all)
+            ch.sigma_all = _sanitize_number(ch.sigma_all)
+            # metrics 中的值
+            ch.metrics.cpk = _sanitize_number(ch.metrics.cpk)
+            ch.metrics.cpk_l1 = _sanitize_number(ch.metrics.cpk_l1)
+            ch.metrics.cpk_l2 = _sanitize_number(ch.metrics.cpk_l2)
+            ch.metrics.custom_cpk = _sanitize_number(ch.metrics.custom_cpk)
+            ch.metrics.r1 = _sanitize_number(ch.metrics.r1)
+            ch.metrics.r2 = _sanitize_number(ch.metrics.r2)
+            ch.metrics.k_value = _sanitize_number(ch.metrics.k_value)
+
         return SPCCpkResponse(
             charts=chart_results,
             summary=summary,
