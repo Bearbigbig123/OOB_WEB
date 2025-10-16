@@ -143,6 +143,70 @@ def init_session_state():
         st.session_state.tool_matching_results = None
     if 'spc_cpk_results' not in st.session_state:
         st.session_state.spc_cpk_results = None
+    if 'logged_in' not in st.session_state:
+        # 預設未登入
+        st.session_state.logged_in = False
+
+
+def authenticate(username: str, password: str) -> bool:
+    """簡單的使用者驗證（預設明文帳密，可替換為環境變數或外部認證服務）"""
+    # TODO: 改為安全的驗證方式，這裡僅示範用途
+    DEFAULT_USER = os.environ.get('OOB_USER', 'admin')
+    DEFAULT_PASS = os.environ.get('OOB_PASS', 'password')
+    return (username == DEFAULT_USER and password == DEFAULT_PASS)
+
+
+def show_login_page():
+    """顯示登入頁面並處理登入事件"""
+    st.title("請先登入")
+    st.markdown("請輸入帳號與密碼以使用系統。此示範使用程式內或環境變數設定的帳密。")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        username = st.text_input("帳號", key="login_user")
+        password = st.text_input("密碼", type="password", key="login_pass")
+    with col2:
+        if st.button("登入"):
+            if authenticate(username, password):
+                st.session_state.logged_in = True
+                safe_rerun()
+            else:
+                st.error("登入失敗：帳號或密碼不正確")
+
+
+def logout():
+    st.session_state.logged_in = False
+    safe_rerun()
+
+
+def safe_rerun():
+    """安全的重載函式：優先使用 Streamlit 的 experimental_rerun，若不存在則嘗試改變 query params 並停止執行以觸發重新載入。"""
+    # 1) 如果有 experimental_rerun 直接呼叫
+    rerun_fn = getattr(st, 'experimental_rerun', None)
+    if callable(rerun_fn):
+        try:
+            rerun_fn()
+            return
+        except Exception:
+            # 如果呼叫失敗，繼續 fallback
+            pass
+
+    # 2) 使用 query_params 觸發 reload（較新版本的 Streamlit）
+    try:
+        params = dict(st.query_params or {})
+    except Exception:
+        params = {}
+    params['_refresh_time'] = datetime.now().isoformat()
+    try:
+        st.query_params = params
+    except Exception:
+        pass
+
+    # 3) 停止當前執行，讓 Streamlit 重新整理畫面
+    try:
+        st.stop()
+    except Exception:
+        pass
 
 def check_api_connection():
     """檢查並顯示 API 連線狀態"""
@@ -1841,6 +1905,10 @@ def main():
     """主函數"""
     # 初始化
     init_session_state()
+    # 檢查登入狀態
+    if not st.session_state.logged_in:
+        show_login_page()
+        return
     
     # 標題和導航
     st.title("OSAT SPC System")
@@ -1874,6 +1942,9 @@ def main():
         if st.button("🔄 重新檢查連線", key="refresh_connection"):
             check_api_connection()
             st.rerun()
+        st.markdown("---")
+        if st.button("登出", key="logout_button"):
+            logout()
 
 if __name__ == "__main__":
     main()
