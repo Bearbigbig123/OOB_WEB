@@ -373,7 +373,7 @@ def review_kshift_results(results, resolution, characteristic, data_percentiles,
         is_significant_diff = not pd.isna(abs_diff) and abs_diff >= resolution
 
         # 判斷 K 絕對值是否超過 2 (且非NaN)
-        is_significant_k = not pd.isna(k_value) and abs(k_value) > 1.67
+        is_significant_k = not pd.isna(k_value) and abs(k_value) > 2
 
         # 新增判斷 k_value 是否為無限值
         is_infinite_k = not pd.isna(k_value) and np.isinf(abs(k_value))
