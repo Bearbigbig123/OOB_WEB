@@ -524,8 +524,8 @@ def render_split_chart_page():
         
         split_mode = st.selectbox(
             "選擇分割模式",
-            ["Type3_Horizontal", "Type2_Vertical"],
-            help="Type3_Horizontal: 橫向資料格式，多個chart在不同欄位\nType2_Vertical: 縱向資料格式，所有chart在同一檔案透過 GroupName 和 ChartName 區分"
+            ["Type3_Horizontal", "Type2_Vertical", "Vendor_Vertical", "Test_Horizontal"],
+            help="Type3_Horizontal: 橫向資料格式，多個chart在不同欄位\nType2_Vertical: 縱向資料格式，所有chart在同一檔案透過 GroupName 和 ChartName 區分\nVendor_Vertical: 廠商格式，欄位 Part ID / Item Name / Report Time / Lot Mean / Vendor Site 自動對應標準欄位\nTest_Horizontal: 測試橫向格式，Part ID / FT Test End Time / Test Site 後接水平測試項目欄位，自動 melt 轉換"
         )
         
         # 輸出資料夾設定（暫時關閉）
@@ -593,6 +593,31 @@ def render_split_chart_page():
         - 所有chart資料在同一檔案
         - 透過 GroupName 和 ChartName 區分不同chart
         - 需要標準欄位：GroupName、ChartName、point_time、point_val
+        """)
+
+    if split_mode == "Vendor_Vertical":
+        st.info("""
+        **Vendor_Vertical (廠商縱向格式)**  
+        適用於廠商提供的標準報表格式，系統將自動進行欄位對應：
+        | 原始欄位 | 對應標準欄位 |
+        |---|---|
+        | Part ID | GroupName |
+        | Item Name | ChartName |
+        | Report Time | point_time |
+        | Lot Mean | point_val |
+        | Vendor Site | Matching |
+        """)
+
+    if split_mode == "Test_Horizontal":
+        st.info("""
+        **Test_Horizontal (測試橫向格式)**  
+        適用於 FT 測試報表，固定欄位後接水平展開的測試項目，系統自動 melt 轉為縱向格式：
+        | 原始欄位 | 對應標準欄位 |
+        |---|---|
+        | Part ID | GroupName |
+        | FT Test End Time | point_time |
+        | Test Site | Matching |
+        | （其後所有欄位） | ChartName（欄名）/ point_val（值） |
         """)
     
     # 處理分割執行邏輯

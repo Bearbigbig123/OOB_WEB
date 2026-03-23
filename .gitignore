@@ -1,0 +1,16 @@
+# 忽略所有檔案
+*
+
+# 排除 (Keep) 你想要的副檔名
+!*.py
+!*.md
+!*.txt
+!.gitignore
+
+# 如果你有特定的資料夾要排除（例如之前的 temp_uploads 或 output）
+# 即使裡面有 .txt 也一併忽略
+temp_uploads/
+output/
+__pycache__/
+.venv/
+.env

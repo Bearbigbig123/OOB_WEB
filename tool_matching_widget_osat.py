@@ -1827,9 +1827,9 @@ class ToolMatchingWidget(QtWidgets.QWidget):
 # 無 UI 版本的核心分析函數，供 FastAPI 使用
 # ==================================================
 
-def analyze_tool_matching_data(df, config):
+def _legacy_analyze_tool_matching_data_v1(df, config):
     """
-    無 UI 版本的 Tool Matching 分析
+    無 UI 版本的 Tool Matching 分析（舊版，已由批次模式取代）
     
     Args:
         df (pd.DataFrame): 輸入的 DataFrame
@@ -2349,71 +2349,6 @@ def _analyze_two_groups_time_headless(mean_df, sigma_df, group_stats, gname, cna
     _analyze_two_groups_headless(group_stats, gname, cname, characteristic, results, mean_df, config)
 
 
-def _analyze_multiple_groups_time_headless(mean_df, sigma_df, group_stats, gname, cname, characteristic, results, config):
-    """無 UI 版本的時間模式多群分析"""
-    # 計算中位數
-    valid_mean_df = mean_df.groupby("matching_group").filter(lambda x: len(x) >= 5)
-    sigma_by_group = sigma_df.groupby("matching_group")["point_val"].std()
-    valid_groups = group_stats[group_stats['count'] >= 5]['matching_group']
-    valid_sigma = sigma_by_group[valid_groups] if not valid_groups.empty else pd.Series(dtype=float)
-    
-    if len(valid_groups) <= 1:
-        for i, row in group_stats.iterrows():
-            results.append([
-                False, 'Insufficient Data', gname, cname, row["matching_group"], 
-                'Insufficient Data', 'Insufficient Data', get_k_value_headless(row["count"]), 
-                row["mean"], row["std"], '-', '-', row["count"], characteristic
-            ])
-        return
-
-    mean_median = valid_mean_df["point_val"].median() if not valid_mean_df.empty else 0
-    median_sigma = valid_sigma.median() if not valid_sigma.empty else 0
-
-    for i, row in group_stats.iterrows():
-        group = row["matching_group"]
-        mean = row["mean"]
-        std = row["std"]  # 來自 mean_df（一個月 window）
-        n = row["count"]
-        
-        if n < 5:
-            results.append([
-                gname, cname, group, "group_all",
-                'Insufficient Data', 'Insufficient Data', 
-                get_k_value_headless(n), mean, std, 
-                mean_median, median_sigma, n, characteristic
-            ])
-            continue
-
-        # Mean index 計算
-        if median_sigma > 0:
-            if characteristic == 'Bigger':
-                mean_index = (mean_median - mean) / median_sigma
-            elif characteristic in ['Smaller', 'Sigma']:
-                mean_index = (mean - mean_median) / median_sigma
-            else:
-                mean_index = abs(mean - mean_median) / median_sigma
-            sigma_index = std / median_sigma
-        else:
-            mean_index = 0 if mean == mean_median else float('inf')
-            sigma_index = 0 if std == median_sigma else float('inf')
-
-        K = get_k_value_headless(n)
-        if K == "No Compare":
-            results.append([
-                gname, cname, group, "group_all",
-                'Insufficient Data', 'Insufficient Data', 
-                'No Compare', round(mean, 2), round(std, 2), 
-                round(mean_median, 2), round(median_sigma, 2), n, characteristic
-            ])
-        else:
-            results.append([
-                gname, cname, group, "group_all",
-                round(mean_index, 2), round(sigma_index, 2), 
-                round(K, 2), round(mean, 2), round(std, 2), 
-                round(mean_median, 2), round(median_sigma, 2), n, characteristic
-            ])
-
-
 def perform_statistical_test(data_groups, method="auto", alpha=0.05):
     """
     執行統計檢定（無 UI 版本）
@@ -2527,8 +2462,8 @@ def get_k_value_headless(n):
         return 1.15
 
 
-def analyze_tool_matching_data(df, config=None):
-    """分析 Tool Matching 資料（與 PyQt 版本完全一致的結果格式）"""
+def _legacy_analyze_tool_matching_data_v2(df, config=None):
+    """分析 Tool Matching 資料（舊版，已由批次模式取代）"""
     try:
         config = config or {}
         
@@ -2788,6 +2723,314 @@ def _get_abnormal_type_headless(mean_status, sigma_index, k_value, config):
         return 'Normal'
     
     return ', '.join(abnormal_types)
+
+
+# ==================================================
+# 批次任務模式核心分析函數（OOB Excel + 資料夾）
+# ==================================================
+
+def analyze_tool_matching_data(all_charts_info: "pd.DataFrame", raw_data_directory: str, config: dict) -> dict:
+    """
+    批次任務模式：遍歷 all_charts_info 中每個 (GroupName, ChartName)，
+    在 raw_data_directory 找對應 CSV，執行 1M Mean / 6M Sigma 雙視窗分析。
+
+    Args:
+        all_charts_info: DataFrame with [GroupName, ChartName, Characteristics]
+        raw_data_directory: str, 含原始 CSV 的資料夾路徑
+        config: dict，可包含 base_date, fill_sample_size, mean_index_threshold,
+                sigma_index_threshold, use_statistical_test, statistical_method, alpha_level
+
+    Returns:
+        dict: {
+            "summary": {"total_groups": int, "abnormal_groups": int},
+            "results": pd.DataFrame[gname, cname, group, group_all,
+                        mean_index, sigma_index, k_value, mean, std,
+                        mean_median, sigma_median, n, characteristic]
+        }
+    """
+    try:
+        from oob_eng import find_matching_file as _find_file
+    except ImportError:
+        _find_file = None
+
+    base_date_raw = config.get('base_date')
+    fill_num = int(config.get('fill_sample_size', 5))
+    base_date = pd.Timestamp(base_date_raw) if base_date_raw else pd.Timestamp.now().normalize()
+
+    results = []
+
+    for _, chart_row in all_charts_info.iterrows():
+        gname = str(chart_row.get('GroupName', '')).strip()
+        cname = str(chart_row.get('ChartName', '')).strip()
+        characteristic = str(
+            chart_row.get('Characteristics') or chart_row.get('Characteristic') or 'Nominal'
+        ).strip()
+
+        if not gname or not cname:
+            continue
+
+        # 尋找對應 CSV
+        csv_path = None
+        if _find_file is not None:
+            try:
+                csv_path = _find_file(raw_data_directory, gname, cname)
+            except Exception:
+                pass
+
+        if not csv_path or not os.path.isfile(csv_path):
+            continue
+
+        # 讀取 CSV
+        try:
+            subdf = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"[WARNING] Failed to read {csv_path}: {e}")
+            continue
+
+        # 移除 point_time 無效行並轉換為 datetime
+        if 'point_time' not in subdf.columns:
+            print(f"[WARNING] {gname}/{cname}: No point_time column")
+            continue
+        subdf = subdf.dropna(subset=['point_time']).copy()
+        try:
+            subdf['point_time'] = pd.to_datetime(subdf['point_time'])
+        except Exception:
+            continue
+        subdf = subdf[subdf['point_time'].notna()].copy()
+
+        # 自動偵測群組欄位：ByTool > EQP_id > Matching > matching_group
+        if 'matching_group' not in subdf.columns:
+            for possible_col in ['ByTool', 'EQP_id', 'Tool', 'tool_id', 'Matching']:
+                if possible_col in subdf.columns:
+                    subdf = subdf.rename(columns={possible_col: 'matching_group'})
+                    break
+                    
+        if 'matching_group' not in subdf.columns:
+            print(f"[WARNING] {gname}/{cname}: No group column found")
+            continue
+        if 'point_val' not in subdf.columns:
+            print(f"[WARNING] {gname}/{cname}: No point_val column")
+            continue
+
+        all_groups = subdf['matching_group'].unique()
+
+        # 安全開關：總資料量 < 5 筆則全部標記 Insufficient Data
+        if len(subdf) < 5:
+            for mg in all_groups:
+                results.append([
+                    gname, cname, str(mg), 'group_all',
+                    'Insufficient Data', 'Insufficient Data', 'No Compare',
+                    0.0, 0.0, '-', '-',
+                    int(len(subdf[subdf['matching_group'] == mg])), characteristic
+                ])
+            continue
+
+        # 雙視窗切片（1M Mean / 6M Sigma）
+        mean_end = base_date
+        mean_start = mean_end - pd.DateOffset(days=30)
+        sigma_end = base_date
+        data_before_base = subdf[subdf['point_time'] <= sigma_end]
+        sigma_df_6m = data_before_base[
+            data_before_base['point_time'] > (sigma_end - pd.DateOffset(days=180))
+        ].copy()
+        # 直接使用 6M 視窗；若資料不足，下方「補足 fill_num 筆」邏輯會自動回填
+        sigma_df = sigma_df_6m
+        mean_df = subdf[(subdf['point_time'] > mean_start) & (subdf['point_time'] <= mean_end)].copy()
+
+        # 補足每台機台的 mean_df（不足 5 筆則忽略時間限制，往回抓最近 5 筆）
+        for mg in all_groups:
+            if len(mean_df[mean_df['matching_group'] == mg]) < 5:
+                mg_fill = (
+                    subdf[subdf['matching_group'] == mg]
+                    .sort_values('point_time', ascending=False)
+                    .head(5)
+                )
+                mean_df = pd.concat([mean_df, mg_fill]).drop_duplicates()
+
+        # 補足每台機台的 sigma_df
+        for mg in all_groups:
+            if len(sigma_df[sigma_df['matching_group'] == mg]) < fill_num:
+                mg_fill = (
+                    subdf[subdf['matching_group'] == mg]
+                    .sort_values('point_time', ascending=False)
+                    .head(fill_num)
+                )
+                sigma_df = pd.concat([sigma_df, mg_fill]).drop_duplicates()
+
+        # 計算統計量
+        mean_stats = mean_df.groupby('matching_group')['point_val'].agg(['mean', 'count']).reset_index()
+        sigma_stats = sigma_df.groupby('matching_group')['point_val'].agg(['std']).reset_index()
+        group_stats = pd.merge(mean_stats, sigma_stats, on='matching_group', how='outer')
+        group_stats = group_stats.fillna({'mean': 0.0, 'std': 0.0, 'count': 0})
+
+        n_groups = len(group_stats)
+        valid_groups_df = group_stats[group_stats['count'] >= 5]
+        n_valid = len(valid_groups_df)
+
+        row_results = []
+        if n_valid == 2 and n_groups > 2:
+            _analyze_two_groups_time_headless(
+                mean_df, sigma_df, valid_groups_df, gname, cname, characteristic, row_results, config)
+        elif n_groups == 2:
+            _analyze_two_groups_time_headless(
+                mean_df, sigma_df, group_stats, gname, cname, characteristic, row_results, config)
+        else:
+            _analyze_multiple_groups_time_headless(
+                mean_df, sigma_df, group_stats, gname, cname, characteristic, row_results, config)
+        results.extend(row_results)
+
+    _COLS = ['gname', 'cname', 'group', 'group_all', 'mean_index', 'sigma_index',
+             'k_value', 'mean', 'std', 'mean_median', 'sigma_median', 'n', 'characteristic']
+    result_df = pd.DataFrame(results, columns=_COLS) if results else pd.DataFrame(columns=_COLS)
+
+    mean_th = config.get('mean_index_threshold', 1.0)
+    sigma_th_cfg = config.get('sigma_index_threshold', 2.0)
+    use_stats = config.get('use_statistical_test', False)
+
+    def _is_abnormal_row(mi, si, kv):
+        if mi == 'Insufficient Data' or si == 'Insufficient Data' or kv == 'No Compare':
+            return False
+        if use_stats:
+            return isinstance(mi, str) and 'Significant' in mi and 'No Significant' not in mi
+        try:
+            sigma_th = float(kv) if isinstance(kv, (int, float)) else sigma_th_cfg
+            return (isinstance(mi, (int, float)) and float(mi) >= mean_th) or \
+                   (isinstance(si, (int, float)) and float(si) >= sigma_th)
+        except Exception:
+            return False
+
+    result_df['is_abnormal'] = result_df.apply(
+        lambda r: _is_abnormal_row(r.get('mean_index'), r.get('sigma_index'), r.get('k_value')), axis=1
+    )
+    abnormal_count = int(result_df['is_abnormal'].sum())
+
+    return {
+        "summary": {"total_groups": len(result_df), "abnormal_groups": abnormal_count},
+        "results": result_df,
+    }
+
+
+def _create_spc_chart(
+    subdf: "pd.DataFrame", gname: str, cname: str,
+    output_dir: str = "output", return_bytes: bool = False
+):
+    """生成 SPC 散佈圖。
+    - return_bytes=False：儲存到 output_dir，回傳檔案路徑 (str)。
+    - return_bytes=True：不儲檔，直接回傳 bytes。
+    兩者都會在 finally 執行 plt.close(fig) 防止記憶體溢出。
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib import cm
+    from io import BytesIO
+
+    unique_groups = sorted(subdf["matching_group"].unique(), key=lambda x: str(x))
+    n_g = max(len(unique_groups), 1)
+    colors = cm.get_cmap('tab20')(np.linspace(0, 1, n_g))
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    try:
+        import pandas as pd
+        import matplotlib.dates as mdates
+
+        has_time = "point_time" in subdf.columns
+        if has_time:
+            subdf = subdf.copy()
+            subdf["point_time"] = pd.to_datetime(subdf["point_time"], errors="coerce")
+            subdf = subdf.sort_values("point_time")
+
+        for i, mg in enumerate(unique_groups):
+            grp = subdf[subdf["matching_group"] == mg]
+            if grp.empty:
+                continue
+            if has_time:
+                x_vals = grp["point_time"]
+            else:
+                x_vals = grp.index
+            y_vals = grp["point_val"].values
+            ax.scatter(x_vals, y_vals, color=colors[i], alpha=0.8, s=40, label=str(mg), zorder=3)
+            ax.plot(x_vals, y_vals, color=colors[i], alpha=0.5, linewidth=1, zorder=2)
+
+        ax.set_title(f"SPC Chart: {gname} - {cname}", fontsize=10)
+        ax.set_xlabel("Time" if has_time else "Sample Index")
+        ax.set_ylabel("Point Value")
+        ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
+        if has_time:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+            fig.autofmt_xdate(rotation=45)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+        fig.tight_layout()
+        if return_bytes:
+            buf = BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+            return buf.getvalue()
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            safe = lambda s: str(s).replace('/', '_').replace(' ', '_')
+            out_path = os.path.join(output_dir, f"{safe(gname)}_{safe(cname)}_spc.png")
+            fig.savefig(out_path, format='png', bbox_inches='tight', dpi=100)
+            return out_path
+    finally:
+        plt.close(fig)
+
+
+def _create_boxplot_chart(
+    subdf: "pd.DataFrame", gname: str, cname: str,
+    output_dir: str = "output", return_bytes: bool = False
+):
+    """生成盒鬚圖。
+    - return_bytes=False：儲存到 output_dir，回傳檔案路徑 (str)。
+    - return_bytes=True：不儲檔，直接回傳 bytes。
+    兩者都會在 finally 執行 plt.close(fig) 防止記憶體溢出。
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib import cm
+    from io import BytesIO
+
+    unique_groups = sorted(subdf["matching_group"].unique(), key=lambda x: str(x))
+    labels = [str(mg) for mg in unique_groups]
+    n_g = max(len(unique_groups), 1)
+    colors = cm.get_cmap('tab20')(np.linspace(0, 1, n_g))
+    box_data = [subdf[subdf["matching_group"] == mg]["point_val"].values for mg in unique_groups]
+    group_stats = subdf.groupby("matching_group")["point_val"].agg(['mean', 'std', 'count'])
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    try:
+        if box_data and any(len(d) > 0 for d in box_data):
+            bp = ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+            legend_labels = []
+            for label, mg in zip(labels, unique_groups):
+                if mg in group_stats.index:
+                    s = group_stats.loc[mg]
+                    legend_labels.append(
+                        f"{label}: \u03bc={s['mean']:.2f}, \u03c3={s['std']:.2f}, n={int(s['count'])}"
+                    )
+                else:
+                    legend_labels.append(label)
+            ax.legend([bp["boxes"][i] for i in range(len(labels))], legend_labels,
+                      loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+        ax.set_title(f"Boxplot: {gname} - {cname}", fontsize=10)
+        ax.set_xlabel("Matching Group")
+        ax.set_ylabel("Point Value")
+        ax.grid(True, linestyle='--', alpha=0.6)
+        fig.tight_layout()
+        if return_bytes:
+            buf = BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
+            return buf.getvalue()
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            safe = lambda s: str(s).replace('/', '_').replace(' ', '_')
+            out_path = os.path.join(output_dir, f"{safe(gname)}_{safe(cname)}_box.png")
+            fig.savefig(out_path, format='png', bbox_inches='tight', dpi=100)
+            return out_path
+    finally:
+        plt.close(fig)
 
 
 # 只在有 UI 且直接執行時才啟動 GUI

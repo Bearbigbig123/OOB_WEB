@@ -123,14 +123,30 @@ def load_execution_time(raw_data_file):
 
 def load_chart_information(raw_data_file):
     import pandas as pd
+    import openpyxl
     print("Loading chart information...")
-    all_charts_info = pd.read_excel(raw_data_file, sheet_name='Chart', engine='openpyxl')
-    
-    expected_columns = ['GroupName', 'ChartName', 'Material_no', 'CHART_CREATE_TIME', 'USL', 'LSL', 'UCL', 'LCL', 'Target', 'ChartID', 'Characteristics']
+
+    # 自動尋找包含必要欄位的 sheet，不強制要求名稱為 'Chart'
+    required_cols = {'GroupName', 'ChartName', 'USL', 'LSL'}
+    wb = openpyxl.load_workbook(raw_data_file, read_only=True)
+    sheet_names = wb.sheetnames
+    wb.close()
+
+    all_charts_info = None
+    for sname in sheet_names:
+        df_try = pd.read_excel(raw_data_file, sheet_name=sname, engine='openpyxl')
+        if required_cols.issubset(set(df_try.columns)):
+            all_charts_info = df_try
+            break
+
+    if all_charts_info is None:
+        raise ValueError(f"找不到含有 {required_cols} 欄位的 sheet，檔案內 sheets: {sheet_names}")
+
+    expected_columns = ['GroupName', 'ChartName', 'Material_no', 'USL', 'LSL', 'UCL', 'LCL', 'Target', 'ChartID', 'Characteristics']
     for col in expected_columns:
         if col not in all_charts_info.columns:
             raise KeyError(f"Column '{col}' does not exist in chart information")
-    
+
     return all_charts_info
 
 def preprocess_raw_df(raw_df):
@@ -168,9 +184,11 @@ def format_and_clean_data(raw_df, chart_info):
         infer_datetime_format=True  # 加速轉換
     )
     
-    create_time = pd.to_datetime(chart_info['CHART_CREATE_TIME'], format="%m/%d/%Y %I:%M:%S %p", errors='coerce')
     raw_df.dropna(subset=['point_val', 'point_time'], inplace=True)
-    raw_df = raw_df[raw_df['point_time'] >= create_time]
+    if 'CHART_CREATE_TIME' in chart_info and pd.notna(chart_info['CHART_CREATE_TIME']):
+        create_time = pd.to_datetime(chart_info['CHART_CREATE_TIME'], format="%m/%d/%Y %I:%M:%S %p", errors='coerce')
+        if pd.notna(create_time):
+            raw_df = raw_df[raw_df['point_time'] >= create_time]
     return raw_df
 def update_chart_limits(raw_df, chart_info):
     import numpy as np
@@ -221,7 +239,10 @@ def preprocess_data(chart_info, raw_df):
         
         raw_df, chart_info = update_chart_limits(raw_df, chart_info)  # 確保這個函數已經是最佳化的
         raw_df = exclude_oos_data(raw_df)
-        raw_df = raw_df[['point_val', 'point_time']]
+        # 保留機台欄位以供後續 by-tool 繪圖使用
+        tool_cols = [c for c in ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id'] if c in raw_df.columns]
+        keep_cols = ['point_val', 'point_time'] + tool_cols
+        raw_df = raw_df[keep_cols]
         
         
         chart_info = chart_info.rename({
@@ -369,16 +390,24 @@ def review_kshift_results(results, resolution, characteristic, data_percentiles,
 
         # --- 修改點開始：簡化高亮條件 ---
 
-        # 判斷絕對差值是否超過 resolution (且非NaN)
-        is_significant_diff = not pd.isna(abs_diff) and abs_diff >= resolution
+        # 判斷 resolution 是否有效（可選填）
+        has_valid_resolution = not pd.isna(resolution) and resolution is not None and resolution > 0
 
-        # 判斷 K 絕對值是否超過 2 (且非NaN)
-        is_significant_k = not pd.isna(k_value) and abs(k_value) > 2
+        # 判斷絕對差值是否顯著
+        if has_valid_resolution:
+            # 有填寫 resolution: 使用 resolution 作為閾值
+            is_significant_diff = not pd.isna(abs_diff) and abs_diff >= resolution
+        else:
+            # 沒填寫 resolution: 只要有差異就算顯著
+            is_significant_diff = not pd.isna(abs_diff)
+
+        # 判斷 K 絕對值是否超過 1.67 (且非NaN)
+        is_significant_k = not pd.isna(k_value) and abs(k_value) > 1.67
 
         # 新增判斷 k_value 是否為無限值
         is_infinite_k = not pd.isna(k_value) and np.isinf(abs(k_value))
 
-        # 設定初始高亮: 絕對差值 > resolution 且 (K絕對值 > 2 或 K絕對值為無限)
+        # 設定初始高亮: 絕對差值 > resolution 且 (K絕對值 > 1.67 或 K絕對值為無限)
         if is_significant_diff and (is_significant_k or is_infinite_k):  # 使用 AND 和 OR 結合邏輯
             highlight_conditions[f'{percentile}_shift'] = 'HIGHLIGHT'   
 
@@ -506,74 +535,40 @@ def kshift_sigma_ratio_calculator(base, data, characteristic, resolution, ucl, l
 
     if data_cnt == 1:
         print("  kshift: 處理 data_cnt == 1 分支 (週數據只有 1 點)")
-        days_to_roll = 1
-        rolled_data_values = np.copy(data_values) # 從單點週數據開始
 
-        # 修正無限迴圈：在 base_values 變空時跳出迴圈
-        # 並且確保合併後的數據長度達到 5
-        while len(rolled_data_values) < 5:
-            print(f"  kshift: While 迴圈開始, days_to_roll: {days_to_roll}, rolled_data_values len: {len(rolled_data_values)}")
+        # 只借不扣：計算需要從 base_values 借入的點數，不修改原始 base_values
+        needed = max(0, 5 - len(data_values))
+        if needed > 0 and len(base_values) > 0:
+            borrowed_data = base_values[-needed:]  # 取 base_values 最後 needed 個點
+            rolled_data_values = np.concatenate((borrowed_data, data_values))
+            print(f"  kshift: 簡單切片：從 base_values 借用末尾 {len(borrowed_data)} 點，"
+                  f"assembled rolled_data_values shape: {rolled_data_values.shape}")
+        else:
+            rolled_data_values = np.copy(data_values)
+            print(f"  kshift: 無需借用或 base_values 為空，rolled_data_values shape: {rolled_data_values.shape}")
 
-            # 如果 base_values 已經是空的，無法再滾動，跳出
-            if len(base_values) == 0:
-                print("  kshift: base_values 已經是空的，無法再滾動。跳出迴圈。")
-                break
-
-            # 呼叫 rolling_calculation 前
-            print(f"  kshift: 呼叫 rolling_calculation 前, base_values shape: {base_values.shape}, days_to_roll: {days_to_roll}")
-            try:
-                rolled_base_values = rolling_calculation(base_values, days_to_roll)
-                print(f"  kshift: rolling_calculation 返回 shape: {rolled_base_values.shape}")
-
-                # 合併數據
-                print(f"  kshift: 合併 rolled_data_values ({rolled_data_values.shape}) 與 rolled_base_values ({rolled_base_values.shape})")
-                rolled_data_values = np.concatenate((rolled_data_values, rolled_base_values))
-                print(f"  kshift: 合併後 rolled_data_values shape: {rolled_data_values.shape}")
-
-                # 縮短 base_values，用於下一次迴圈
-                base_values = base_values[:-days_to_roll]
-                print(f"  kshift: 縮短後 base_values shape: {base_values.shape}")
-
-            except Exception as e:
-                 print(f"  kshift: rolling_calculation 或合併數據時發生錯誤: {e}")
-                 traceback.print_exc()
-                 # 如果發生錯誤，可能無法繼續，返回預設結果
-                 return pd.Series(results)
-
-
-            days_to_roll += 1
-            # 保持安全跳出機制，防止意外情況
-            if days_to_roll > base_cnt + 10: # 如果 rolling 天數遠超過原始基線數據，可能出錯
-                print("  kshift: 警告：rolling 迴圈 days_to_roll 過大，可能邏輯有誤或數據問題。強制跳出。")
-                break
-
-
-        print(f"  kshift: While 迴圈結束。最終 rolled_data_values shape: {rolled_data_values.shape}")
-
-        # 迴圈結束後，檢查是否湊滿了至少 5 個點用於滾動計算
+        # 點數不足 5 時無法穩定計算，返回預設值
         if len(rolled_data_values) < 5:
-             print(f"  kshift: 警告：無法湊滿至少 5 個點用於滾動計算 (實際湊到 {len(rolled_data_values)} 點)。滾動結果將使用現有數據，計算可能不穩定。")
-             # 您可以根據需求決定如果點數不足 5 時是否返回預設結果
-             return pd.Series(results) # 如果少於 5 點則視為無法計算並返回預設值
+            print(f"  kshift: 警告：base_values 點數不足，無法湊滿 5 點 "
+                  f"(實際 {len(rolled_data_values)} 點)。返回預設值。")
+            return pd.Series(results)
 
-
-        # 計算百分位數 (使用原始單點數據和滾動/填充後的數據)
+        # 計算百分位數 (原始單點週數據 & 滾動/填充後數據)
         try:
-            data_percentiles = get_percentiles(data_values) # 這是用原始單點週數據算的
+            data_percentiles = get_percentiles(data_values)  # 原始單點週數據
             print(f"  kshift: 原始週數據 percentiles (data_cnt=1): {data_percentiles}")
 
-            rolled_data_percentiles = get_percentiles(rolled_data_values) # 這是用滾動後的數據算的
+            rolled_data_percentiles = get_percentiles(rolled_data_values)  # 滾動後數據
             print(f"  kshift: 滾動數據 percentiles (shape={rolled_data_values.shape}): {rolled_data_percentiles}")
 
             rolled_data = {'values': rolled_data_values, 'percentiles': rolled_data_percentiles}
 
-            # 檢查計算K值所需的當前和滾動數據百分位數是否存在且非NaN
             for p in ['P95', 'P50', 'P05']:
                 if np.isnan(data_percentiles.get(p, np.nan)):
-                     print(f"  kshift: 警告：原始週數據 {p} 百分位數為 NaN。無法計算 K 值。")
-                     return pd.Series(results)
+                    print(f"  kshift: 警告：原始週數據 {p} 百分位數為 NaN。無法計算 K 值。")
+                    return pd.Series(results)
                 if np.isnan(rolled_data_percentiles.get(p, np.nan)):
-                     print(f"  kshift: 警告：滾動數據 {p} 百分位數為 NaN。影響滾動 K 值計算。") # 這裡只是警告，可能可以繼續
+                    print(f"  kshift: 警告：滾動數據 {p} 百分位數為 NaN。影響滾動 K 值計算。")
 
         except Exception as e:
             print(f"  kshift: 計算百分位數時發生錯誤 (data_cnt=1 分支): {e}")
@@ -607,14 +602,41 @@ def kshift_sigma_ratio_calculator(base, data, characteristic, resolution, ucl, l
 
     # --- 計算分母 ---
     try:
+        # 檢查 UCL/LCL 是否有效（支援單邊規格）
+        ucl_valid = not pd.isna(ucl) and ucl is not None
+        lcl_valid = not pd.isna(lcl) and lcl is not None
 
-        # 計算分母，加入安全除法和替代邏輯
-        p95k_deno = np.round(np.max([safe_division(base_percentiles.get('P99.865', np.nan) - base_percentiles.get('P50', np.nan), 3),
-                                     safe_division(ucl - base_percentiles.get('P50', np.nan), 6)]), 8)
-        p50k_deno = np.round(np.max([safe_division(base_percentiles.get('P99.865', np.nan) - base_percentiles.get('P0.135', np.nan), 6),
-                                     safe_division(ucl - lcl, 12)]), 8)
-        p05k_deno = np.round(np.max([safe_division(base_percentiles.get('P50', np.nan) - base_percentiles.get('P0.135', np.nan), 3),
-                                     safe_division(base_percentiles.get('P50', np.nan) - lcl, 6)]), 8)
+        # 計算百分位數基礎分母值
+        p95k_percentile = safe_division(base_percentiles.get('P99.865', np.nan) - base_percentiles.get('P50', np.nan), 3)
+        p50k_percentile = safe_division(base_percentiles.get('P99.865', np.nan) - base_percentiles.get('P0.135', np.nan), 6)
+        p05k_percentile = safe_division(base_percentiles.get('P50', np.nan) - base_percentiles.get('P0.135', np.nan), 3)
+
+        # P95 分母計算：需要 UCL
+        if ucl_valid:
+            p95k_ucl = safe_division(ucl - base_percentiles.get('P50', np.nan), 6)
+            p95k_deno = np.round(np.max([p95k_percentile, p95k_ucl]), 8)
+            print(f"  kshift: P95 分母使用 max(百分位數={p95k_percentile}, UCL計算={p95k_ucl}) = {p95k_deno}")
+        else:
+            p95k_deno = np.round(p95k_percentile, 8)
+            print(f"  kshift: UCL 無效，P95 分母直接使用百分位數 = {p95k_deno}")
+
+        # P50 分母計算：需要 UCL 和 LCL
+        if ucl_valid and lcl_valid:
+            p50k_ucl_lcl = safe_division(ucl - lcl, 12)
+            p50k_deno = np.round(np.max([p50k_percentile, p50k_ucl_lcl]), 8)
+            print(f"  kshift: P50 分母使用 max(百分位數={p50k_percentile}, UCL-LCL計算={p50k_ucl_lcl}) = {p50k_deno}")
+        else:
+            p50k_deno = np.round(p50k_percentile, 8)
+            print(f"  kshift: UCL/LCL 無效，P50 分母直接使用百分位數 = {p50k_deno}")
+
+        # P05 分母計算：需要 LCL
+        if lcl_valid:
+            p05k_lcl = safe_division(base_percentiles.get('P50', np.nan) - lcl, 6)
+            p05k_deno = np.round(np.max([p05k_percentile, p05k_lcl]), 8)
+            print(f"  kshift: P05 分母使用 max(百分位數={p05k_percentile}, LCL計算={p05k_lcl}) = {p05k_deno}")
+        else:
+            p05k_deno = np.round(p05k_percentile, 8)
+            print(f"  kshift: LCL 無效，P05 分母直接使用百分位數 = {p05k_deno}")
 
         # YC edit：分母為 0 時的處理邏輯
         if p95k_deno == 0:
@@ -833,35 +855,31 @@ def trending(raw_df, weekly_start_date, weekly_end_date, baseline_start_date, ba
     baseline_start_date = pd.to_datetime(baseline_start_date)
     baseline_end_date = pd.to_datetime(baseline_end_date)
 
-    # 每週資料的摘要
-    weekly_summary = []
-    current_end = weekly_end_date
-    week_count = 0
+    # [優化] 預過濾 49 天窗口（7週 × 7天）一次性獲取所有需要的數據
+    window_start = weekly_end_date - timedelta(days=48)  # 包含最後一天，所以是 48
+    weekly_window_df = raw_df[
+        (raw_df['point_time'] >= window_start) &
+        (raw_df['point_time'] <= weekly_end_date)
+    ].copy()
 
-    while week_count < 7:
-        current_start = current_end - timedelta(days=6)
-        week_data = raw_df[
-            (raw_df['point_time'] >= current_start) &
-            (raw_df['point_time'] <= current_end)
-        ]['point_val']
-
-        weekly_summary.append({
-            'week_start': current_start,
-            'week_end': current_end,
-            'median': week_data.median() if not week_data.empty else np.nan,
-            'count': len(week_data)
-        })
-
-        current_end = current_start - timedelta(days=1)
-        week_count += 1
-
-    weekly_data = pd.DataFrame(weekly_summary)
-
-    if weekly_data.empty:
+    if weekly_window_df.empty:
         return 'NO_HIGHLIGHT'
 
-    weekly_medians = weekly_data['median'].tolist()
-    weekly_counts = weekly_data['count'].tolist()
+    # [優化] 使用 floor division 計算每個數據點屬於哪一週（相對於 weekly_end_date）
+    # week_id = 0 表示最近一週，week_id = 6 表示第7週（最早）
+    days_from_end = (weekly_end_date - weekly_window_df['point_time']).dt.days
+    weekly_window_df['week_id'] = (days_from_end // 7).clip(upper=6)
+
+    # [優化] 一次性分組計算所有週的統計數據
+    weekly_grouped = weekly_window_df.groupby('week_id')['point_val'].agg(['median', 'count'])
+
+    # [重要] 使用 reindex 確保所有 7 週都存在，即使沒有數據（填充 NaN 和 0）
+    weekly_grouped = weekly_grouped.reindex(range(7))
+    weekly_grouped['count'] = weekly_grouped['count'].fillna(0)
+
+    # 提取列表（保持原始順序：week_id 0 = 最新週）
+    weekly_medians = weekly_grouped['median'].tolist()
+    weekly_counts = weekly_grouped['count'].fillna(0).astype(int).tolist()
 
     # 檢查最近幾週的資料點數條件
     def check_weeks_condition(weeks_counts):
@@ -1460,11 +1478,27 @@ def calculate_sigma(UCL, LCL, mean):
     sigma_lower = (mean - LCL) / 3
     return sigma_upper, sigma_lower    
 def check_rules(raw_df, chart_info):
-    mean = chart_info['Target']
-    sigma_upper, sigma_lower = calculate_sigma(chart_info['UCL'], chart_info['LCL'], mean)
-    UWL = mean + 2 * sigma_upper
-    LWL = mean - 2 * sigma_lower
+    import pandas as pd
+    import numpy as np
+
+    mean = chart_info.get('Target')
+    UCL = chart_info.get('UCL')
+    LCL = chart_info.get('LCL')
     characteristics = chart_info['Characteristics']
+
+    # 計算 sigma（可能返回 NaN）
+    sigma_upper, sigma_lower = calculate_sigma(UCL, LCL, mean)
+
+    # 檢查 sigma 是否有效
+    sigma_valid = not pd.isna(sigma_upper) and not pd.isna(sigma_lower) and not pd.isna(mean)
+
+    if sigma_valid:
+        UWL = mean + 2 * sigma_upper
+        LWL = mean - 2 * sigma_lower
+    else:
+        UWL = np.nan
+        LWL = np.nan
+        print("  [Warning] check_rules: Sigma 無效，WE2-WE10 將設為 False")
 
     rules = {
         "WE2": False,
@@ -1474,11 +1508,31 @@ def check_rules(raw_df, chart_info):
         "WE7": False,
         "WE8": False,
         "WE9": False,
-        "WE10": False
+        "WE10": False,
+        "CU1": False,
+        "CU2": False
     }
 
-    rules["WE1"] = raw_df['point_val'].iloc[-1] > chart_info['UCL']
-    rules["WE5"] = raw_df['point_val'].iloc[-1] < chart_info['LCL']
+    # WE1/WE5: 只需要 UCL/LCL，不依賴 sigma
+    if not pd.isna(UCL) and UCL is not None:
+        rules["WE1"] = raw_df['point_val'].iloc[-1] > UCL
+    if not pd.isna(LCL) and LCL is not None:
+        rules["WE5"] = raw_df['point_val'].iloc[-1] < LCL
+
+    # CU1/CU2: 趨勢規則，不依賴 sigma
+    if chart_info.get('CU1', 'N') == 'Y' and len(raw_df) >= 7:
+        tail_7 = raw_df['point_val'].tail(7)
+        diffs = tail_7.diff().dropna()
+        rules["CU1"] = bool((diffs > 0).all())
+
+    if chart_info.get('CU2', 'N') == 'Y' and len(raw_df) >= 7:
+        tail_7 = raw_df['point_val'].tail(7)
+        diffs = tail_7.diff().dropna()
+        rules["CU2"] = bool((diffs < 0).all())
+
+    # WE2-WE10 需要 sigma 有效才能判斷
+    if not sigma_valid:
+        return rules  # Sigma 無效，直接返回（WE1/WE5/CU1/CU2 已判斷）
 
     if chart_info.get('WE2', 'N') == 'Y' and len(raw_df) >= 3:
         rules["WE2"] = (raw_df['point_val'].tail(3) > UWL).sum() >= 2 if characteristics not in ['Bigger', 'Smaller', 'Sigma'] else False
@@ -1536,7 +1590,7 @@ def calculate_cpk(raw_df, chart_info):
         cpk = round(cpk, 3)  # 統一四捨五入到小數第三位
 
     return {'Cpk': cpk}
-def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug=False):
+def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug=False, output_dir: str = 'output'):
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -1555,15 +1609,9 @@ def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug
     raw_df['point_time'] = pd.to_datetime(raw_df['point_time'])
     raw_df = raw_df.sort_values('point_time').reset_index(drop=True)
 
-    # === 點數限制 ===
-    max_points = 10000
+    # === 使用全部數據，無點數限制 ===
+    print(f"  plot_spc_chart: 使用全部數據點數 {len(raw_df)}")
     original_length = len(raw_df)
-
-    if len(raw_df) > max_points:
-        print(f"  plot_spc_chart: 原始數據點數 {original_length} 超過限制 {max_points}，截取最近 {max_points} 點")
-        raw_df = raw_df.tail(max_points).reset_index(drop=True)
-    else:
-        print(f"  plot_spc_chart: 數據點數 {original_length} 未超過限制 {max_points}，使用全部數據")
 
     points_num = len(raw_df)
     x_values = np.arange(points_num)
@@ -1621,26 +1669,22 @@ def plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug
     ax.spines['right'].set_visible(False)
     ax.spines['top'].set_visible(False)
 
-    if original_length > max_points:
-        plt.figtext(0.02, 0.0, f"顯示最近 {max_points} 點 (原始: {original_length} 點)", 
-                   fontsize=8, color='gray', ha='left')
-
     plt.tight_layout()
 
-    output_path = 'output'
+    output_path = output_dir
     os.makedirs(output_path, exist_ok=True)
     safe_group_name = "" if group_name == "Default" else group_name
     image_path = f"{output_path}/SPC_{safe_group_name}_{chart_info['chart_name']}.png"
 
-    plt.savefig(image_path, bbox_inches='tight')
-    plt.close()
+    try:
+        plt.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close()
 
     return image_path, violated_rules
 
 
-    
-
-def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug=False):
+def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, debug=False, output_dir: str = 'output'):
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -1662,11 +1706,13 @@ def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date
         plt.figure(figsize=(14, 6))
         plt.title("No weekly data", loc='left')
         plt.tight_layout()
-        output_path = 'output'
+        output_path = output_dir
         os.makedirs(output_path, exist_ok=True)
         image_path = f'{output_path}/Weekly_SPC_empty.png'
-        plt.savefig(image_path, bbox_inches='tight')
-        plt.close()
+        try:
+            plt.savefig(image_path, bbox_inches='tight')
+        finally:
+            plt.close()
         return image_path
 
     # 若需要限制點數（可選）
@@ -1726,19 +1772,501 @@ def plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date
 
     plt.tight_layout()
 
-    output_path = 'output'
+    output_path = output_dir
     os.makedirs(output_path, exist_ok=True)
     safe_group_name = "" if group_name == "Default" else group_name
     image_path = f'{output_path}/Weekly_SPC_{safe_group_name}_{chart_info["chart_name"]}.png'
-    plt.savefig(image_path, bbox_inches='tight')
-    plt.close()
+    try:
+        plt.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close()
 
     # 回傳圖片路徑（如需，也可以回傳 violated_points 供 debug 使用）
     return image_path
-def save_results_to_excel(results_df, scale_factor=0.3):
+
+
+def plot_qq_plot(raw_df, chart_info, output_dir: str = 'output'):
+    """
+    繪製 QQ Plot（常態分佈檢定圖）。
+    支援多機台分色繪製（偵測 ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']）。
+    回傳輸出的 PNG 檔案路徑。
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from scipy import stats
+
+    df = raw_df.copy()
+    df = df.dropna(subset=['point_val'])
+
+    group_name = chart_info.get('group_name', '')
+    chart_name = chart_info.get('chart_name', '')
+    display_group_name = "" if group_name == "Default" else f"Group: [{group_name}] "
+
+    possible_tool_cols = ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']
+    tool_col = next((c for c in possible_tool_cols if c in df.columns), None)
+
+    # 判斷是否有多機台
+    tools = None
+    if tool_col:
+        valid_series = df[tool_col].dropna().astype(str).str.strip()
+        valid_series = valid_series[valid_series != ""]
+        if valid_series.nunique() > 1:
+            tools = sorted(valid_series.unique())
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    title = (f"{display_group_name}[{chart_name}][{chart_info.get('Characteristics', '')}]\n"
+             f"Q-Q Plot (常態分佈檢定)")
+    ax.set_title(title, loc='left', fontsize=12)
+    ax.set_xlabel("Theoretical Quantiles")
+    ax.set_ylabel("Sample Quantiles")
+
+    if tools is not None:
+        colors = plt.cm.tab10(np.linspace(0, 1, len(tools)))
+        for i, tool in enumerate(tools):
+            mask = df[tool_col].astype(str).str.strip() == tool
+            vals = df.loc[mask, 'point_val'].dropna().values
+            if len(vals) < 2:
+                continue
+            (osm, osr), (slope, intercept, _) = stats.probplot(vals, dist='norm')
+            ax.scatter(osm, osr, s=15, color=colors[i], label=str(tool), alpha=0.7)
+            ax.plot(osm, slope * np.array(osm) + intercept, color=colors[i], linewidth=1)
+        ax.legend(title=tool_col, fontsize=8, markerscale=1.5)
+    else:
+        vals = df['point_val'].values
+        if len(vals) >= 2:
+            (osm, osr), (slope, intercept, _) = stats.probplot(vals, dist='norm')
+            ax.scatter(osm, osr, s=15, color='#5863F8', alpha=0.8)
+            ax.plot(osm, slope * np.array(osm) + intercept, color='#E83F6F', linewidth=1.5, label='Normal fit')
+            ax.legend(fontsize=8)
+
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+    fig.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_group_name = "" if group_name == "Default" else group_name
+    image_path = f'{output_dir}/QQ_{safe_group_name}_{chart_name}_qq_plot.png'
+    try:
+        fig.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+    return image_path
+
+
+# ============================================================================
+# 統一輔助函數
+# ============================================================================
+
+def get_unified_title(chart_info):
+    """
+    統一標題生成邏輯
+    標題範例：[GroupName][ChartName][Nominal]
+    """
+    group_name = chart_info.get('group_name', '')
+    display_group = f"[{group_name}]" if group_name and group_name != "Default" else ""
+    return f"{display_group}[{chart_info['chart_name']}][{chart_info['Characteristics']}]"
+
+
+def add_right_cl_labels(ax, chart_info, x_pos=None):
+    """
+    在圖表右側添加 UCL/Target/LCL 標籤（使用 axes transform）
+    """
+    import pandas as pd
+    if x_pos is None:
+        x_pos = 1.002
+    labels = [
+        (chart_info.get('UCL'), 'UCL', '#E83F6F'),
+        (chart_info.get('Target'), 'Target', '#087E8B'),
+        (chart_info.get('LCL'), 'LCL', '#E83F6F'),
+    ]
+    for y_val, text, color in labels:
+        if y_val is not None and pd.notna(y_val):
+            ax.text(x_pos, y_val, text, va='center', ha='left',
+                    fontsize=10, color=color, fontweight='bold',
+                    transform=ax.get_yaxis_transform())
+
+
+def add_spc_background_zones(ax, df, weekly_start_date, weekly_end_date):
+    """
+    在 ax 上添加週區間（紅色）與基線區間（藍色）的背景底色
+    """
+    import pandas as pd
+    try:
+        ws = pd.to_datetime(weekly_start_date)
+        we = pd.to_datetime(weekly_end_date)
+        weekly_mask = (df['point_time'] >= ws) & (df['point_time'] <= we)
+        if weekly_mask.any():
+            start_idx = df.index[weekly_mask].min()
+            end_idx = df.index[weekly_mask].max()
+            ax.axvspan(start_idx - 0.5, end_idx + 0.5, color='#E83F6F', alpha=0.15, zorder=-1, label='Weekly')
+            if start_idx > 0:
+                ax.axvspan(-0.5, start_idx - 0.5, color='#3772FF', alpha=0.15, zorder=-1, label='Baseline')
+    except Exception:
+        pass
+
+
+# ============================================================================
+# 新增畫圖函數（PNG 輸出版）
+# ============================================================================
+
+def plot_spc_chart_interactive(raw_df, chart_info, weekly_start_date, weekly_end_date,
+                               record_results=None, debug=False, use_batch_id_labels=False,
+                               oob_info="N/A", output_dir: str = 'output'):
+    """
+    Total SPC 完整趨勢圖（PNG 版）
+    與 plot_spc_chart 功能相同，但使用統一標題格式與輔助函數，
+    子標題顯示 "Total Trend Analysis"。
+    回傳 (image_path, violated_rules)
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    raw_df = raw_df.copy()
+    raw_df['point_time'] = pd.to_datetime(raw_df['point_time'])
+    raw_df = raw_df.sort_values('point_time').reset_index(drop=True)
+
+    print(f"  plot_spc_chart_interactive: 數據點數 {len(raw_df)}")
+
+    points_num = len(raw_df)
+    x_values = np.arange(points_num)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    unified_title = get_unified_title(chart_info)
+    ax.set_title(f"{unified_title}\nTotal Trend Analysis", loc='left', fontsize=10)
+
+    # 控制線
+    for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
+                          (chart_info.get('Target'), '#087E8B'),
+                          (chart_info.get('LCL'), '#E83F6F')]:
+        if y_val is not None and pd.notna(y_val):
+            ax.hlines(y_val, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+    add_right_cl_labels(ax, chart_info)
+
+    # 背景底色
+    add_spc_background_zones(ax, raw_df, weekly_start_date, weekly_end_date)
+
+    # 主折線
+    ax.plot(x_values, raw_df['point_val'], color='#5863F8', marker='o', linestyle='-', markersize=4)
+
+    # 找當週 index
+    ws = pd.to_datetime(weekly_start_date)
+    we = pd.to_datetime(weekly_end_date)
+    start_index = raw_df[raw_df['point_time'] >= ws].index.min()
+    end_index = raw_df[raw_df['point_time'] <= we].index.max()
+
+    if debug:
+        print(f"[DEBUG] start_index={start_index}, end_index={end_index}")
+
+    # 檢查 rule，標紅點
+    violated_rules = {rule: False for rule in chart_info.get('rule_list', [])}
+    if pd.notna(start_index) and pd.notna(end_index):
+        for i in range(int(start_index), int(end_index) + 1):
+            data_subset = raw_df.iloc[:i + 1].tail(15)
+            if not data_subset.empty:
+                rules = check_rules(data_subset.copy(), chart_info)
+                for rule, violated in rules.items():
+                    if violated:
+                        violated_rules[rule] = True
+                        ax.plot(i, raw_df['point_val'].iloc[i], 'ro', markersize=6)
+
+    # X 軸
+    interval = max(1, len(raw_df) // 30)
+    ax.set_xticks(x_values[::interval])
+    if use_batch_id_labels and 'Batch_ID' in raw_df.columns:
+        ax.set_xticklabels(raw_df['Batch_ID'].astype(str)[::interval], rotation=90, fontsize=7)
+    else:
+        ax.set_xticklabels(raw_df['point_time'].dt.strftime("%Y-%m-%d")[::interval], rotation=90, fontsize=7)
+
+    ax.set_xlim([x_values[0] - 1, None])
+    ax.legend(loc='upper left', fontsize=7)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    plt.tight_layout()
+
+    output_path = output_dir
+    os.makedirs(output_path, exist_ok=True)
+    group_name = chart_info.get('group_name', '')
+    safe_group_name = "" if group_name == "Default" else group_name
+    image_path = f"{output_path}/SPC_Interactive_{safe_group_name}_{chart_info['chart_name']}.png"
+    try:
+        plt.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+    return image_path, violated_rules
+
+
+def plot_spc_by_tool_color(raw_df, chart_info, weekly_start_date, weekly_end_date, oob_info="N/A", output_dir: str = 'output'):
+    """
+    Total SPC By Tool（顏色區分），PNG 版本。
+    各機台以不同顏色的點標示，背景底色同 plot_spc_chart_interactive。
+    自動偵測機台欄位 ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']。
+    回傳 image_path
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    df = raw_df.copy()
+    df['point_time'] = pd.to_datetime(df['point_time'])
+    df = df.sort_values('point_time').reset_index(drop=True)
+
+    # 自動偵測機台欄位
+    possible_tool_cols = ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']
+    tool_col = next((c for c in possible_tool_cols if c in df.columns), None)
+    if tool_col is None:
+        df['ByTool'] = 'Unknown'
+        tool_col = 'ByTool'
+    df[tool_col] = df[tool_col].fillna('Unknown').astype(str)
+
+    unique_tools = sorted(df[tool_col].unique())
+    cmap = plt.cm.tab10
+    tool_color_map = {tool: cmap(i % 10) for i, tool in enumerate(unique_tools)}
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    group_name = chart_info.get('group_name', '')
+    display_group_name = "" if group_name == "Default" else f"Group: [{group_name}]"
+    title = (f"{display_group_name}[{chart_info['chart_name']}][{chart_info['Characteristics']}]\n"
+             f"UCL: [{chart_info.get('UCL')}] | Target: [{chart_info.get('Target')}] | LCL: [{chart_info.get('LCL')}]")
+    ax.set_title(title, loc='left', fontsize=12)
+
+    # 背景底色（weekly / baseline）
+    add_spc_background_zones(ax, df, weekly_start_date, weekly_end_date)
+
+    # 灰色連接線（時間順序）
+    ax.plot(df.index, df['point_val'], color='#696969', alpha=0.4, zorder=1)
+
+    # 各機台彩色點
+    for tool in unique_tools:
+        subset = df[df[tool_col] == tool]
+        ax.plot(subset.index, subset['point_val'], marker='o', linestyle='',
+                color=tool_color_map[tool], label=tool, markersize=5, zorder=3)
+
+    # 控制線
+    for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
+                          (chart_info.get('Target'), '#087E8B'),
+                          (chart_info.get('LCL'), '#E83F6F')]:
+        if y_val is not None and pd.notna(y_val):
+            ax.hlines(y_val, -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
+    add_right_cl_labels(ax, chart_info)
+
+    # X 軸：顯示 point_time 日期，採樣間隔避免標籤重疊
+    n = len(df)
+    interval = max(1, n // 30)
+    tick_pos = df.index[::interval]
+    tick_labels = df['point_time'].dt.strftime('%Y-%m-%d').iloc[::interval]
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels(tick_labels, rotation=90)
+
+    ax.legend(loc='upper left', fontsize=8, ncol=4)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    fig.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_group_name = "" if group_name == "Default" else group_name
+    image_path = f"{output_dir}/SPC_ByToolColor_{safe_group_name}_{chart_info['chart_name']}.png"
+    try:
+        fig.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+    return image_path
+
+
+def plot_spc_by_tool_group(raw_df, chart_info, oob_info="N/A", output_dir: str = 'output'):
+    """
+    Total SPC By Tool（水平分組），PNG 版本。
+    各機台資料按 [機台, point_time] 排列在 X 軸，機台邊界繪製虛線。
+    自動偵測機台欄位 ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']。
+    回傳 image_path
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    df = raw_df.copy()
+    df['point_time'] = pd.to_datetime(df['point_time'])
+
+    # 自動偵測機台欄位
+    possible_tool_cols = ['ByTool', 'EQP_id', 'Matching', 'Tool', 'tool_id']
+    tool_col = next((c for c in possible_tool_cols if c in df.columns), None)
+    if tool_col is None:
+        df['ByTool'] = 'Unknown'
+        tool_col = 'ByTool'
+    df[tool_col] = df[tool_col].fillna('Unknown').astype(str)
+
+    # 依 [機台欄位, point_time] 排序並 reset_index
+    df = df.sort_values([tool_col, 'point_time']).reset_index(drop=True)
+
+    unique_tools = sorted(df[tool_col].unique())
+    cmap = plt.cm.tab10
+    tool_color_map = {tool: cmap(i % 10) for i, tool in enumerate(unique_tools)}
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    group_name = chart_info.get('group_name', '')
+    display_group_name = "" if group_name == "Default" else f"Group: [{group_name}]"
+    title = (f"{display_group_name}[{chart_info['chart_name']}][{chart_info['Characteristics']}]\n"
+             f"UCL: [{chart_info.get('UCL')}] | Target: [{chart_info.get('Target')}] | LCL: [{chart_info.get('LCL')}]")
+    ax.set_title(title, loc='left', fontsize=12)
+
+    for i, tool in enumerate(unique_tools):
+        subset = df[df[tool_col] == tool]
+        ax.plot(subset.index, subset['point_val'], marker='o', markersize=4,
+                color=tool_color_map[tool], label=tool, alpha=0.8, zorder=3)
+        # 機台邊界虛線（分群感）
+        if i > 0:
+            boundary = subset.index.min() - 0.5
+            ax.axvline(x=boundary, color='gray', linestyle='--', linewidth=1, alpha=0.5, zorder=1)
+
+    # 控制線
+    for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
+                          (chart_info.get('Target'), '#087E8B'),
+                          (chart_info.get('LCL'), '#E83F6F')]:
+        if y_val is not None and pd.notna(y_val):
+            ax.hlines(y_val, -0.5, len(df), colors=color, linestyles='--', linewidth=1, zorder=2)
+    add_right_cl_labels(ax, chart_info)
+
+    # X 軸：顯示 point_time 日期，採樣間隔避免標籤重疊
+    n = len(df)
+    interval = max(1, n // 30)
+    tick_pos = df.index[::interval]
+    tick_labels = df['point_time'].dt.strftime('%Y-%m-%d').iloc[::interval]
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels(tick_labels, rotation=90)
+
+    ax.legend(loc='upper left', fontsize=8, ncol=4)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    fig.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_group_name = "" if group_name == "Default" else group_name
+    image_path = f"{output_dir}/SPC_ByToolGroup_{safe_group_name}_{chart_info['chart_name']}.png"
+    try:
+        fig.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+    return image_path
+
+
+def plot_weekly_spc_chart_interactive(raw_df, chart_info, weekly_start_date, weekly_end_date,
+                                      record_results=None, debug=False, use_batch_id_labels=False,
+                                      oob_info="N/A", output_dir: str = 'output'):
+    """
+    Weekly SPC 圖表（PNG 版）
+    與 plot_weekly_spc_chart 功能相同，但使用統一標題格式，
+    子標題顯示 "Weekly Trend Analysis"。
+    回傳 image_path
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    df = raw_df.copy()
+    df['point_time'] = pd.to_datetime(df['point_time'])
+    df = df.sort_values('point_time').reset_index(drop=True)
+
+    ws = pd.to_datetime(weekly_start_date)
+    we = pd.to_datetime(weekly_end_date)
+    df_weekly = df[(df['point_time'] >= ws) & (df['point_time'] <= we)].copy()
+
+    output_path = output_dir
+    os.makedirs(output_path, exist_ok=True)
+    group_name = chart_info.get('group_name', '')
+    safe_group_name = "" if group_name == "Default" else group_name
+    image_path = f"{output_path}/Weekly_SPC_Interactive_{safe_group_name}_{chart_info['chart_name']}.png"
+
+    if df_weekly.empty:
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.set_title("No weekly data", loc='left')
+        plt.tight_layout()
+        try:
+            plt.savefig(image_path, bbox_inches='tight')
+        finally:
+            plt.close(fig)
+        return image_path
+
+    print(f"  plot_weekly_spc_chart_interactive: 週數據點數 {len(df_weekly)}")
+
+    points_num = len(df_weekly)
+    x_values = np.arange(points_num)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    unified_title = get_unified_title(chart_info)
+    ax.set_title(f"{unified_title}\nWeekly Trend Analysis", loc='left', fontsize=10)
+
+    # 控制線
+    for y_val, color in [(chart_info.get('UCL'), '#E83F6F'),
+                          (chart_info.get('Target'), '#087E8B'),
+                          (chart_info.get('LCL'), '#E83F6F')]:
+        if y_val is not None and pd.notna(y_val):
+            ax.hlines(y_val, -0.8, points_num + 2, colors=color, linestyles='--', linewidth=1)
+    add_right_cl_labels(ax, chart_info)
+
+    # 週資料底色（全紅）
+    ax.axvspan(0, max(points_num - 1, 0.5), color='#E83F6F', alpha=0.08, label='Weekly')
+
+    # 主折線
+    ax.plot(x_values, df_weekly['point_val'].values, color='#5863F8', marker='o', linestyle='-', markersize=4)
+
+    # 檢查 rule，標紅點
+    violated_points = []
+    for pos_in_weekly, (global_idx, row) in enumerate(df_weekly.iterrows()):
+        full_data_subset = df.iloc[:global_idx + 1].tail(15)
+        if full_data_subset.empty:
+            continue
+        rules = check_rules(full_data_subset.copy(), chart_info)
+        if any(rules.values()):
+            ax.plot(pos_in_weekly, row['point_val'], 'ro', markersize=6)
+            violated_points.append((pos_in_weekly, global_idx, row['point_time'], row['point_val'], rules))
+            if debug:
+                print(f'[VIOL] weekly_pos={pos_in_weekly} global_idx={global_idx} '
+                      f'time={row["point_time"]} value={row["point_val"]} '
+                      f'rules={ {k: v for k, v in rules.items() if v} }')
+
+    # X 軸
+    interval = max(1, points_num // 30)
+    ax.set_xticks(x_values[::interval])
+    if use_batch_id_labels and 'Batch_ID' in df_weekly.columns:
+        ax.set_xticklabels(df_weekly['Batch_ID'].astype(str)[::interval], rotation=90, fontsize=7)
+    else:
+        ax.set_xticklabels(df_weekly['point_time'].dt.strftime("%Y-%m-%d")[::interval], rotation=90, fontsize=7)
+
+    ax.set_xlim([x_values[0] - 1, None])
+    ax.legend(loc='upper left', fontsize=7)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+
+    plt.tight_layout()
+    try:
+        plt.savefig(image_path, bbox_inches='tight')
+    finally:
+        plt.close(fig)
+
+    return image_path
+
+
+def save_results_to_excel(results_df, scale_factor=0.3, output_path: str = 'result_with_images.xlsx'):
     results_df['group_name'] = results_df['group_name'].replace("Default", "")  # 替換 Default 為空白
 
-    workbook = xlsxwriter.Workbook('result_with_images.xlsx')
+    workbook = xlsxwriter.Workbook(output_path)
     worksheet = workbook.add_worksheet()
 
     cell_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 10})
@@ -2722,7 +3250,7 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
         return self.csv_cache[filepath].copy() if self.csv_cache[filepath] is not None else None
 
 
-    def analyze_chart(self, execution_time, raw_df, chart_info):
+    def analyze_chart(self, execution_time, raw_df, chart_info, task_output_dir: str = 'output'):
         # 補齊 rule_list，確保每個 chart 都有正確的 WE 規則清單
         if 'rule_list' not in chart_info or not chart_info['rule_list']:
             rule_list = []
@@ -2791,11 +3319,11 @@ class SPCApp(QtWidgets.QMainWindow): # 將 QTabWidget 改為 QMainWindow
             print(f" - analyze_chart: 準備生成圖表 for {group_name}/{chart_name}")
             
             # 生成 SPC 圖表
-            image_path, violated_rules = plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date)
+            image_path, violated_rules = plot_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, output_dir=task_output_dir)
             print(f" - analyze_chart: plot_spc_chart 完成，image_path: {image_path}")
 
             # 生成週圖表
-            weekly_image_path = plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date)
+            weekly_image_path = plot_weekly_spc_chart(raw_df, chart_info, weekly_start_date, weekly_end_date, output_dir=task_output_dir)
             print(f" - analyze_chart: plot_weekly_spc_chart 完成，weekly_image_path: {weekly_image_path}")
 
             # Cpk 計算
