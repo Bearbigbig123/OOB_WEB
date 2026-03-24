@@ -187,7 +187,7 @@ def generate_full_excel_with_images(data_list, mode):
     cell_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'font_name': 'Arial', 'font_size': 10})
 
     # 決定要排除的欄位 (圖片路徑不需要顯示為文字)
-    exclude_cols = ['chart_path', 'weekly_chart_path', 'by_tool_color_path', 'by_tool_group_path', 'qq_plot_path', 'chart_image', 'spc_chart_path', 'boxplot_chart_path']
+    exclude_cols = ['chart_path', 'weekly_chart_path', 'by_tool_color_path', 'by_tool_group_path', 'qq_plot_path', 'chart_image', 'spc_chart_path', 'boxplot_chart_path', 'timeline_chart_path']
     data_cols = [c for c in df.columns if c not in exclude_cols]
 
     is_oob_mode = mode == "OOB/SPC"
@@ -204,10 +204,11 @@ def generate_full_excel_with_images(data_list, mode):
     ]
     # CPK: 1 張圖表欄位 (base64)
     cpk_img_fields = [('chart_image', 'SPC Chart')]
-    # TM: 2 張圖表欄位 (file path)
+    # TM: 3 張圖表欄位 (file path)
     tm_img_fields = [
         ('spc_chart_path', 'SPC Chart'),
         ('boxplot_chart_path', 'Boxplot'),
+        ('timeline_chart_path', 'Timeline'),
     ]
 
     if is_oob_mode:
@@ -484,7 +485,10 @@ with col2:
         st.caption("✅ 任務已完成，請點擊左下方表格任意一列檢視圖表")
     elif st.session_state.status == "failed":
         st.progress(0)
-        st.caption("❌ 任務失敗")
+        err_msg = ""
+        if st.session_state.task_id and st.session_state.task_id in st.session_state.get('_last_errors', {}):
+            err_msg = st.session_state['_last_errors'][st.session_state.task_id]
+        st.caption(f"❌ 任務失敗{f': {err_msg}' if err_msg else ''}")
     if st.session_state.auto_split_info:
         st.caption(st.session_state.auto_split_info)
 
@@ -500,10 +504,6 @@ with col3:
 
 with col4:
     st.caption(f"👤 {st.session_state.login_user}")
-    if st.button("登出", use_container_width=True):
-        st.session_state.logged_in = False
-        st.session_state.login_user = ""
-        st.rerun()
 
 # ==========================================
 # 1.5 延遲執行分析 (彈窗關閉後才送出 API)
@@ -538,7 +538,13 @@ if st.session_state.status == "processing" and st.session_state.task_id:
             st.rerun()
         elif status == "failed":
             st.session_state.status = "failed"
-            st.error(f"後端出錯: {resp.get('error')}")
+            err = resp.get('error', '')
+            if err:
+                if '_last_errors' not in st.session_state:
+                    st.session_state['_last_errors'] = {}
+                st.session_state['_last_errors'][st.session_state.task_id] = err
+                st.error(f"後端出錯: {err}")
+            st.rerun()
         else:
             time.sleep(POLLING_INTERVAL)
             st.rerun()
@@ -701,14 +707,7 @@ if st.session_state.results:
                 elif st.session_state.current_mode == "Tool Matching":
                     spc_path = item.get('spc_chart_path')
                     if spc_path and os.path.exists(spc_path):
-                # 💡 使用三欄位 [左留白, 中間圖片, 右留白] 來達成置中效果
-                        # 你可以調整比例，例如 [0.1, 0.8, 0.1] 會讓圖片佔 80% 寬度並置中
-                        img_l, img_m, img_r = st.columns([0.1, 0.8, 0.1])
-                        
-                        with img_m:
-                            # 這裡重新用回 use_container_width=True
-                            # 這樣圖片會撐滿這 80% 的空間，高度也會因為寬度受限而變小
-                            st.image(spc_path, use_container_width=True)
+                        st.image(spc_path, use_container_width=True)
                     else:
                         st.info("此項目無 SPC 圖表。")
             else:
@@ -749,13 +748,20 @@ if st.session_state.results:
                             st.image(valid_rest_charts[i+1][1], use_container_width=True)
 
         elif item and st.session_state.current_mode == "Tool Matching":
+            tl_path = item.get('timeline_chart_path')
             box_path = item.get('boxplot_chart_path')
+            charts_to_show = []
+            if tl_path and os.path.exists(tl_path):
+                charts_to_show.append(("**Timeline (All Tools)**", tl_path))
             if box_path and os.path.exists(box_path):
+                charts_to_show.append(("**Boxplot**", box_path))
+            if charts_to_show:
                 st.divider()
-                box_cols = st.columns(2)
-                with box_cols[0]:
-                    st.markdown("**Boxplot**")
-                    st.image(box_path, width=600)  # 數值可依需求調整，例如 500 或 600
+                bottom_cols = st.columns(len(charts_to_show))
+                for col, (title, path) in zip(bottom_cols, charts_to_show):
+                    with col:
+                        st.markdown(title)
+                        st.image(path, use_container_width=True)
 else:
     if st.session_state.status == "idle":
         st.markdown("<h3 style='text-align: center; color: #888; padding-top: 100px;'>點擊左上角 Settings 開始分析</h3>", unsafe_allow_html=True)

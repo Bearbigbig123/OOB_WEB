@@ -32,8 +32,13 @@ from openpyxl.drawing.image import Image as XLImage
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from contextlib import asynccontextmanager
-from concurrent.futures import ProcessPoolExecutor
 from pydantic import BaseModel, Field
+
+import multiprocessing as mp
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
 
 # ==========================================
 # 內部模組 Imports (oob_eng & tool matching)
@@ -200,6 +205,7 @@ class ToolMatchingResultItem(BaseModel):
     abnormal_type: str = ""
     spc_chart_path: Optional[str] = None
     boxplot_chart_path: Optional[str] = None
+    timeline_chart_path: Optional[str] = None
 
 class ToolMatchingResponse(BaseModel):
     summary: ToolMatchingSummary
@@ -698,82 +704,147 @@ def _analyze_chart_api(execution_time: Optional[pd.Timestamp], raw_df: pd.DataFr
 # Tool Matching 分析模組 (Tool Matching Logic)
 # ==========================================
 def _create_spc_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
-    fig, ax = plt.subplots(figsize=(7, 4.5)) 
+    from io import BytesIO
     unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
-    labels = [str(mg) for mg in unique_groups]
-    
+
     if group_df.empty or not any(len(grp["point_val"]) > 0 for _, grp in group_df.groupby("matching_group")):
         return None
-    
-    colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
-    if 'point_time' in group_df.columns:
-        group_df = group_df.copy()
-        group_df['point_time'] = pd.to_datetime(group_df['point_time'], errors='coerce')
-    
-    x_position = 0
-    for i, mg in enumerate(unique_groups):
-        group_data = group_df[group_df["matching_group"] == mg]
-        if 'point_time' in group_df.columns:
-            group_data = group_data.sort_values("point_time")
-        
-        if not group_data.empty:
-            x_vals = np.arange(x_position, x_position + len(group_data))
-            y_vals = group_data["point_val"].values
-            ax.scatter(x_vals, y_vals, color=colors[i], alpha=0.8, s=40, label=f'{mg}', zorder=3)
-            ax.plot(x_vals, y_vals, color=colors[i], alpha=0.5, linewidth=1, zorder=2)
-            
-            if i < len(unique_groups) - 1: 
-                separator_x = x_position + len(group_data) - 0.5
-                ax.axvline(x=separator_x, color='gray', linestyle='-', alpha=0.3, zorder=1)
-            x_position += len(group_data)
-    
-    ax.set_title(f"SPC Chart: {group_name} - {chart_name}", fontsize=10)
-    ax.set_xlabel("Sample Sequence (Grouped by Matching Group)")
-    ax.set_ylabel("Point Value")
-    ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
-    
-    if unique_groups:
-        group_positions = []
-        x_pos = 0
+
+    has_time = 'point_time' in group_df.columns
+    fig, ax = plt.subplots(figsize=(8, 4))
+    try:
+        colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
+        if has_time:
+            group_df = group_df.copy()
+            group_df['point_time'] = pd.to_datetime(group_df['point_time'], errors='coerce')
+
+        x_position = 0
+        tick_positions = []
+        tick_labels = []
+
+        for i, mg in enumerate(unique_groups):
+            group_data = group_df[group_df["matching_group"] == mg]
+            if has_time:
+                group_data = group_data.sort_values("point_time")
+
+            if not group_data.empty:
+                x_vals = np.arange(x_position, x_position + len(group_data))
+                y_vals = group_data["point_val"].values
+                ax.scatter(x_vals, y_vals, color=colors[i], alpha=0.8, s=40, label=f'{mg}', zorder=3)
+                ax.plot(x_vals, y_vals, color=colors[i], alpha=0.5, linewidth=1, zorder=2)
+
+                if i < len(unique_groups) - 1:
+                    separator_x = x_position + len(group_data) - 0.5
+                    ax.axvline(x=separator_x, color='gray', linestyle='-', alpha=0.3, zorder=1)
+
+                # x 軸標籤：有時間則每個資料點顯示日期，否則顯示組名置中
+                if has_time and group_data['point_time'].notna().any():
+                    times = group_data['point_time'].reset_index(drop=True)
+                    for xi, t in zip(x_vals, times):
+                        if pd.notna(t):
+                            tick_positions.append(xi)
+                            tick_labels.append(pd.Timestamp(t).strftime('%Y-%m-%d'))
+                else:
+                    center = x_position + len(group_data) / 2 - 0.5
+                    tick_positions.append(center)
+                    tick_labels.append(str(mg))
+
+                x_position += len(group_data)
+
+        ax.set_title(f"SPC Chart: {group_name} - {chart_name}", fontsize=10)
+        ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
+        # 最多顯示 15 個 tick，均勻取樣
+        max_ticks = 15
+        if len(tick_positions) > max_ticks:
+            step = len(tick_positions) / max_ticks
+            indices = [int(i * step) for i in range(max_ticks)]
+            tick_positions = [tick_positions[i] for i in indices]
+            tick_labels = [tick_labels[i] for i in indices]
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=90, ha='center', fontsize=8)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        return buf.read()
+    finally:
+        plt.close(fig)
+
+
+def _create_timeline_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
+    """所有 matching_group 混合，依 point_time 排序，各組不同顏色的時序圖。"""
+    from io import BytesIO
+    import matplotlib.dates as mdates
+    if group_df.empty or 'point_time' not in group_df.columns:
+        return None
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    try:
+        df_sorted = group_df.copy()
+        df_sorted['point_time'] = pd.to_datetime(df_sorted['point_time'], errors='coerce')
+        df_sorted = df_sorted.dropna(subset=['point_time']).sort_values('point_time')
+        if df_sorted.empty:
+            return None
+
+        unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
+        colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
+        color_map = {mg: colors[i] for i, mg in enumerate(unique_groups)}
+
+        ax.plot(df_sorted['point_time'].values, df_sorted['point_val'].values,
+                color='lightgray', linewidth=1, zorder=1)
         for mg in unique_groups:
-            group_size = len(group_df[group_df["matching_group"] == mg])
-            group_positions.append(x_pos + group_size/2 - 0.5)
-            x_pos += group_size
-        ax.set_xticks(group_positions)
-        ax.set_xticklabels(labels, rotation=0, ha='center')
-        ax.tick_params(axis='x', which='minor', bottom=True, top=False)
-    
-    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
-    plt.tight_layout()
-    return fig
+            sub = df_sorted[df_sorted['matching_group'] == mg]
+            if not sub.empty:
+                ax.scatter(sub['point_time'].values, sub['point_val'].values,
+                           color=color_map[mg], alpha=0.8, s=40, label=str(mg), zorder=3)
+
+        ax.set_title(f"Timeline: {group_name} - {chart_name}", fontsize=10)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center')
+        ax.grid(True, linestyle='--', alpha=0.3, zorder=0)
+        ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        return buf.read()
+    finally:
+        plt.close(fig)
 
 def _create_boxplot_chart(group_df: pd.DataFrame, group_name: str, chart_name: str):
-    fig, ax = plt.subplots(figsize=(7, 4.5)) 
-    unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
-    labels = [str(mg) for mg in unique_groups]
-    
-    box_data = [group_df[group_df["matching_group"] == mg]["point_val"].values for mg in unique_groups]
-    group_stats = group_df.groupby("matching_group")["point_val"].agg(['mean', 'std', 'count'])
-    colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
-    
-    if box_data:
-        bp = ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-        
-        legend_labels = [
-            f"{label}: μ={group_stats.loc[mg, 'mean']:.2f}, σ={group_stats.loc[mg, 'std']:.2f}, n={int(group_stats.loc[mg, 'count'])}"
-            for label, mg in zip(labels, unique_groups)
-        ]
-        ax.legend([bp["boxes"][i] for i in range(len(labels))], legend_labels, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
-    
-    ax.set_title(f"Boxplot: {group_name} - {chart_name}", fontsize=10)
-    ax.set_xlabel("Matching Group")
-    ax.set_ylabel("Point Value")
-    ax.grid(True, linestyle='--', alpha=0.6)
-    fig.subplots_adjust(right=0.7)
-    plt.tight_layout()
-    return fig
+    from io import BytesIO
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    try:
+        unique_groups = sorted(group_df["matching_group"].unique(), key=lambda x: str(x))
+        labels = [str(mg) for mg in unique_groups]
+
+        box_data = [group_df[group_df["matching_group"] == mg]["point_val"].values for mg in unique_groups]
+        group_stats = group_df.groupby("matching_group")["point_val"].agg(['mean', 'std', 'count'])
+        colors = cm.tab10(np.linspace(0, 1, len(unique_groups)))
+
+        if box_data:
+            bp = ax.boxplot(box_data, labels=labels, patch_artist=True, widths=0.6)
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+
+            legend_labels = [
+                f"{label}: μ={group_stats.loc[mg, 'mean']:.2f}, σ={group_stats.loc[mg, 'std']:.2f}, n={int(group_stats.loc[mg, 'count'])}"
+                for label, mg in zip(labels, unique_groups)
+            ]
+            ax.legend([bp["boxes"][i] for i in range(len(labels))], legend_labels, loc='upper left', bbox_to_anchor=(1.02, 1), fontsize='small')
+
+        ax.set_title(f"Boxplot: {group_name} - {chart_name}", fontsize=10)
+        ax.grid(True, linestyle='--', alpha=0.6)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=90, ha='center')
+        fig.subplots_adjust(right=0.7)
+        plt.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        return buf.read()
+    finally:
+        plt.close(fig)
 
 def _export_tool_matching_to_excel(results_df: pd.DataFrame, chart_bytes: dict, source_path: str) -> str:
     try:
@@ -804,7 +875,8 @@ def _export_tool_matching_to_excel(results_df: pd.DataFrame, chart_bytes: dict, 
             
             excel_data.append({
                 'SPC_Chart': "", 
-                'BoxPlot': "",   
+                'BoxPlot': "",
+                'Timeline_Chart': "",
                 'Need_matching': need_matching,
                 'AbnormalType': abnormal_type,
                 'GroupName': str(row['gname']),
@@ -844,6 +916,7 @@ def _export_tool_matching_to_excel(results_df: pd.DataFrame, chart_bytes: dict, 
                 
                 worksheet.column_dimensions['A'].width = 70 
                 worksheet.column_dimensions['B'].width = 70 
+                worksheet.column_dimensions['C'].width = 70 
                 abnormal_fill = openpyxl.styles.PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
                 img_display_width, img_display_height = 450, 250
                 
@@ -874,9 +947,18 @@ def _export_tool_matching_to_excel(results_df: pd.DataFrame, chart_bytes: dict, 
                                 box_img.width = img_display_width
                                 box_img.height = img_display_height
                                 worksheet.add_image(box_img, f"B{row_idx}")
+                            timeline_b = chart_bytes[chart_key].get('timeline')
+                            if timeline_b:
+                                temp_tl_path = os.path.join(img_temp_dir, f"tl_{group_name}_{chart_name}_{row_idx}.png")
+                                with open(temp_tl_path, 'wb') as _f: _f.write(timeline_b)
+                                tl_img = XLImage(temp_tl_path)
+                                tl_img.width = img_display_width
+                                tl_img.height = img_display_height
+                                worksheet.add_image(tl_img, f"C{row_idx}")
                         except Exception:
                             worksheet.cell(row=row_idx, column=1).value = "Chart failed to load"
                             worksheet.cell(row=row_idx, column=2).value = "Chart failed to load"
+                            worksheet.cell(row=row_idx, column=3).value = "Chart failed to load"
                 
                 for row in range(2, len(df) + 2):
                     worksheet.row_dimensions[row].height = img_display_height * 0.75
@@ -894,8 +976,11 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
 
     try:
         from oob_eng import find_matching_file as _find_file
-        from tool_matching_widget_osat import _create_spc_chart as _tm_spc, _create_boxplot_chart as _tm_box
-        from io import BytesIO
+        import concurrent.futures
+
+        # 第一階段：蒐集可產圖的任務參數
+        task_args = []
+        task_meta = {}  # (gname, cname) -> safe_g, safe_c
 
         for _, chart_row in all_charts_info.iterrows():
             gname = str(chart_row.get('GroupName', ''))
@@ -910,40 +995,44 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
                         df_chart = df_chart.rename(columns={col: 'matching_group'})
                 if 'matching_group' not in df_chart.columns:
                     continue
-
                 safe_g = "".join(c if c.isalnum() or c in "-_" else "_" for c in gname)
                 safe_c = "".join(c if c.isalnum() or c in "-_" else "_" for c in cname)
-                paths = {}
-
-                # SPC scatter chart
-                try:
-                    scatter_b = _tm_spc(df_chart, gname, cname, return_bytes=True)
-                    if scatter_b:
-                        spc_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_spc.png")
-                        with open(spc_path, 'wb') as f:
-                            f.write(scatter_b)
-                        paths['spc'] = os.path.abspath(spc_path)
-                        chart_bytes.setdefault((gname, cname), {})['scatter'] = scatter_b
-                except Exception:
-                    pass
-
-                # Boxplot chart
-                try:
-                    box_b = _tm_box(df_chart, gname, cname, return_bytes=True)
-                    if box_b:
-                        box_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_box.png")
-                        with open(box_path, 'wb') as f:
-                            f.write(box_b)
-                        paths['box'] = os.path.abspath(box_path)
-                        chart_bytes.setdefault((gname, cname), {})['box'] = box_b
-                except Exception:
-                    pass
-
-                if paths:
-                    chart_paths[(gname, cname)] = paths
-
+                task_args.append((gname, cname, df_chart.to_dict('records')))
+                task_meta[(gname, cname)] = (safe_g, safe_c)
             except Exception:
-                pass
+                continue
+
+        # 第二階段：平行產圖
+        if task_args:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+                for result in executor.map(_tool_matching_plot_worker, task_args):
+                    try:
+                        gname, cname, scatter_b, box_b, timeline_b = result
+                        safe_g, safe_c = task_meta.get((gname, cname), (gname, cname))
+                        paths = {}
+                        if scatter_b:
+                            spc_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_spc.png")
+                            with open(spc_path, 'wb') as f:
+                                f.write(scatter_b)
+                            paths['spc'] = os.path.abspath(spc_path)
+                            chart_bytes.setdefault((gname, cname), {})['scatter'] = scatter_b
+                        if box_b:
+                            box_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_box.png")
+                            with open(box_path, 'wb') as f:
+                                f.write(box_b)
+                            paths['box'] = os.path.abspath(box_path)
+                            chart_bytes.setdefault((gname, cname), {})['box'] = box_b
+                        if timeline_b:
+                            tl_path = os.path.join(output_dir, f"TM_{safe_g}_{safe_c}_timeline.png")
+                            with open(tl_path, 'wb') as f:
+                                f.write(timeline_b)
+                            paths['timeline'] = os.path.abspath(tl_path)
+                            chart_bytes.setdefault((gname, cname), {})['timeline'] = timeline_b
+                        if paths:
+                            chart_paths[(gname, cname)] = paths
+                    except Exception:
+                        continue
+
     except Exception:
         pass
 
@@ -1006,17 +1095,17 @@ def get_split_status(split_id: Optional[str] = None) -> Dict[str, Any]:
 # /process 背景任務函式
 # ==========================================
 def _tool_matching_plot_worker(args):
-    """頂層 picklable worker：生成單一 (GroupName, ChartName) 的 scatter + boxplot PNG bytes。"""
+    """頂層 picklable worker：生成單一 (GroupName, ChartName) 的 scatter + boxplot + timeline PNG bytes。"""
     group_name, chart_name, group_df_records = args
     try:
         import pandas as pd
-        from tool_matching_widget_osat import _create_spc_chart, _create_boxplot_chart
         group_df = pd.DataFrame(group_df_records)
-        scatter_bytes = _create_spc_chart(group_df, group_name, chart_name, return_bytes=True)
-        box_bytes = _create_boxplot_chart(group_df, group_name, chart_name, return_bytes=True)
-        return (group_name, chart_name, scatter_bytes, box_bytes)
+        scatter_bytes = _create_spc_chart(group_df, group_name, chart_name)
+        box_bytes = _create_boxplot_chart(group_df, group_name, chart_name)
+        timeline_bytes = _create_timeline_chart(group_df, group_name, chart_name)
+        return (group_name, chart_name, scatter_bytes, box_bytes, timeline_bytes)
     except Exception:
-        return (group_name, chart_name, None, None)
+        return (group_name, chart_name, None, None, None)
 
 
 def _spc_cpk_worker(args):
@@ -1169,9 +1258,12 @@ def _run_process_task(task_id: str, req: ProcessRequest) -> None:
             for _, row in all_charts_info.iterrows()
         ]
 
-        # 多行程平行運算
-        with ProcessPoolExecutor(max_workers=4) as executor:
-            processed_results = list(executor.map(_process_single_chart_worker, task_args))
+        # 平行運算
+        import concurrent.futures
+        processed_results = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            for result in executor.map(_process_single_chart_worker, task_args):
+                processed_results.append(result)
 
         results: List[Dict[str, Any]] = [r for r in processed_results if r is not None]
         skipped = len(processed_results) - len(results)
@@ -1222,7 +1314,8 @@ def _run_process_task(task_id: str, req: ProcessRequest) -> None:
         })
 
     except Exception as e:
-        task_status_db[task_id].update({"status": "failed", "progress": 0, "error": str(e), "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
+        import traceback
+        task_status_db[task_id].update({"status": "failed", "error": f"{e}\n{traceback.format_exc()}", "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
 
 
 def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest) -> None:
@@ -1281,6 +1374,7 @@ def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest) -> None:
                     characteristic=str(row['characteristic']),
                     need_matching=need_matching, abnormal_type=abnormal_type,
                     spc_chart_path=paths.get('spc'), boxplot_chart_path=paths.get('box'),
+                    timeline_chart_path=paths.get('timeline'),
                 ).model_dump())
             except Exception:
                 continue
@@ -1291,7 +1385,8 @@ def _run_tool_matching_task(task_id: str, req: ToolMatchingRequest) -> None:
             "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
         })
     except Exception as e:
-        task_status_db[task_id].update({"status": "failed", "progress": 0, "error": str(e), "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
+        import traceback
+        task_status_db[task_id].update({"status": "failed", "error": f"{e}\n{traceback.format_exc()}", "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
 
 
 def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest) -> None:
@@ -1319,8 +1414,11 @@ def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest) -> None:
             for _, row in all_charts_info.iterrows()
         ]
         task_status_db[task_id]["progress"] = 20
-        with ProcessPoolExecutor(max_workers=4) as executor:
-            raw_results = list(executor.map(_spc_cpk_worker, task_args))
+        import concurrent.futures
+        raw_results = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            for result in executor.map(_spc_cpk_worker, task_args):
+                raw_results.append(result)
         task_status_db[task_id]["progress"] = 80
         chart_result_objs = []
         for r in raw_results:
@@ -1359,7 +1457,8 @@ def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest) -> None:
             "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat(),
         })
     except Exception as e:
-        task_status_db[task_id].update({"status": "failed", "progress": 0, "error": str(e), "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
+        import traceback
+        task_status_db[task_id].update({"status": "failed", "error": f"{e}\n{traceback.format_exc()}", "expires_at": (datetime.now() + timedelta(hours=_TASK_TTL_HOURS)).isoformat()})
 
 
 @app.post("/process")

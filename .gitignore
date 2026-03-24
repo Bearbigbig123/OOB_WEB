@@ -14,3 +14,6 @@ output/
 __pycache__/
 .venv/
 .env
+# 允許抓取 test_split_data 資料夾及其內的所有檔案
+!test_split_data/
+!test_split_data/*
