@@ -1002,10 +1002,11 @@ def _analyze_tool_matching_with_charts_and_excel(all_charts_info: pd.DataFrame, 
             except Exception:
                 continue
 
-        # 第二階段：平行產圖
+        # 第二階段：產圖（序列執行，已停用平行運算）
         if task_args:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-                for result in executor.map(_tool_matching_plot_worker, task_args):
+            # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            #     for result in executor.map(_tool_matching_plot_worker, task_args):
+            for result in map(_tool_matching_plot_worker, task_args):
                     try:
                         gname, cname, scatter_b, box_b, timeline_b = result
                         safe_g, safe_c = task_meta.get((gname, cname), (gname, cname))
@@ -1258,12 +1259,14 @@ def _run_process_task(task_id: str, req: ProcessRequest) -> None:
             for _, row in all_charts_info.iterrows()
         ]
 
-        # 平行運算
-        import concurrent.futures
+        # 序列執行（已停用平行運算）
+        # import concurrent.futures
+        # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+        #     for result in executor.map(_process_single_chart_worker, task_args):
+        #         processed_results.append(result)
         processed_results = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-            for result in executor.map(_process_single_chart_worker, task_args):
-                processed_results.append(result)
+        for result in map(_process_single_chart_worker, task_args):
+            processed_results.append(result)
 
         results: List[Dict[str, Any]] = [r for r in processed_results if r is not None]
         skipped = len(processed_results) - len(results)
@@ -1414,11 +1417,13 @@ def _run_spc_cpk_task(task_id: str, req: SPCCpkRequest) -> None:
             for _, row in all_charts_info.iterrows()
         ]
         task_status_db[task_id]["progress"] = 20
-        import concurrent.futures
+        # import concurrent.futures
+        # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+        #     for result in executor.map(_spc_cpk_worker, task_args):
+        #         raw_results.append(result)
         raw_results = []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-            for result in executor.map(_spc_cpk_worker, task_args):
-                raw_results.append(result)
+        for result in map(_spc_cpk_worker, task_args):
+            raw_results.append(result)
         task_status_db[task_id]["progress"] = 80
         chart_result_objs = []
         for r in raw_results:

@@ -68,6 +68,11 @@ if 'trigger_analysis' not in st.session_state: st.session_state.trigger_analysis
 if 'pending_endpoint' not in st.session_state: st.session_state.pending_endpoint = None
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'login_user' not in st.session_state: st.session_state.login_user = ""
+# 跨功能切換時保留上傳檔案路徑（Streamlit rerun 會清空 file_uploader）
+if 'saved_excel_path' not in st.session_state: st.session_state.saved_excel_path = None
+if 'saved_raw_dir' not in st.session_state: st.session_state.saved_raw_dir = None
+if 'saved_split_raw_dir' not in st.session_state: st.session_state.saved_split_raw_dir = None
+if 'saved_split_id' not in st.session_state: st.session_state.saved_split_id = None
 
 # ==========================================
 # LOGIN GATE
@@ -368,6 +373,8 @@ with col1:
         if st.button("🚀 Start Analysis", type="primary", use_container_width=True):
             st.session_state.current_mode = mode
             st.session_state.results = None
+            st.session_state.status = "idle"
+            st.session_state.progress = 0
             
             # 處理使用者上傳的檔案
             custom_excel_path = None
@@ -382,6 +389,7 @@ with col1:
                     custom_excel_path = os.path.join(base_upload_dir, excel_file.name)
                     with open(custom_excel_path, "wb") as f:
                         f.write(excel_file.getbuffer())
+                    st.session_state.saved_excel_path = custom_excel_path  # 跨功能保留
                 
                 if csv_files:
                     custom_raw_dir = os.path.join(base_upload_dir, "raw_charts")
@@ -390,6 +398,10 @@ with col1:
                         csv_path = os.path.join(custom_raw_dir, csv.name)
                         with open(csv_path, "wb") as f:
                             f.write(csv.getbuffer())
+                    st.session_state.saved_raw_dir = custom_raw_dir  # 跨功能保留
+                    # 新 CSV 上傳時清除舊的 split 快取
+                    st.session_state.saved_split_raw_dir = None
+                    st.session_state.saved_split_id = None
 
             # 自動偵測並拆分待拆格式（一次上傳整份 CSV + AllChart 即可）
             auto_split_id      = None
@@ -432,6 +444,8 @@ with col1:
                             split_result = split_resp.json()
                             auto_split_id      = split_result.get("split_id")
                             auto_split_raw_dir = split_result.get("raw_data_directory")
+                            st.session_state.saved_split_raw_dir = auto_split_raw_dir  # 跨功能保留
+                            st.session_state.saved_split_id = auto_split_id          # 跨功能保留
                             st.session_state.auto_split_info = (
                                 f"🔀 自動偵測到 **{detected_split_mode}** 格式，"
                                 f"已完成拆分（{split_result.get('processed', 0)} 個 chart）"
@@ -443,6 +457,16 @@ with col1:
                 except Exception:
                     pass  # 偵測失敗就視為一般上傳，不影響原有流程
 
+            # 若本次沒有上傳新檔，沿用上一次儲存的路徑（切換功能時 file_uploader 會被清空）
+            if not custom_excel_path:
+                custom_excel_path = st.session_state.saved_excel_path
+            if not custom_raw_dir:
+                custom_raw_dir = st.session_state.saved_raw_dir
+            if not auto_split_raw_dir:
+                auto_split_raw_dir = st.session_state.saved_split_raw_dir
+            if not auto_split_id:
+                auto_split_id = st.session_state.saved_split_id
+
             # 組裝 API Payload
             payload = {}
             if mode == "OOB/SPC":
@@ -450,6 +474,8 @@ with col1:
                 if custom_excel_path: payload["filepath"] = custom_excel_path
                 if auto_split_id:
                     payload["split_id"] = auto_split_id
+                elif auto_split_raw_dir:
+                    payload["raw_data_directory"] = auto_split_raw_dir
                 elif custom_raw_dir:
                     payload["raw_data_directory"] = custom_raw_dir
             elif mode == "Tool Matching":
@@ -500,6 +526,10 @@ with col3:
         st.session_state.results = None
         st.session_state.progress = 0
         st.session_state.full_excel_data = None
+        st.session_state.saved_excel_path = None
+        st.session_state.saved_raw_dir = None
+        st.session_state.saved_split_raw_dir = None
+        st.session_state.saved_split_id = None
         st.rerun()
 
 with col4:
