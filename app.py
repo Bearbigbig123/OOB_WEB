@@ -73,6 +73,7 @@ if 'saved_excel_path' not in st.session_state: st.session_state.saved_excel_path
 if 'saved_raw_dir' not in st.session_state: st.session_state.saved_raw_dir = None
 if 'saved_split_raw_dir' not in st.session_state: st.session_state.saved_split_raw_dir = None
 if 'saved_split_id' not in st.session_state: st.session_state.saved_split_id = None
+if 'saved_split_info' not in st.session_state: st.session_state.saved_split_info = None
 
 # ==========================================
 # LOGIN GATE
@@ -376,64 +377,57 @@ with col1:
             st.session_state.status = "idle"
             st.session_state.progress = 0
             
-            # 處理使用者上傳的檔案
-            custom_excel_path = None
-            custom_raw_dir = None
-            
+            current_excel_path = None
+            current_raw_dir = None
+
+            # --- 1. 處理「新上傳」的檔案 ---
             if excel_file or csv_files:
                 upload_session_id = str(uuid.uuid4())
                 base_upload_dir = os.path.abspath(os.path.join("temp_uploads", "ui_uploads", upload_session_id))
                 os.makedirs(base_upload_dir, exist_ok=True)
                 
                 if excel_file:
-                    custom_excel_path = os.path.join(base_upload_dir, excel_file.name)
-                    with open(custom_excel_path, "wb") as f:
-                        f.write(excel_file.getbuffer())
-                    st.session_state.saved_excel_path = custom_excel_path  # 跨功能保留
+                    excel_file.seek(0)
+                    current_excel_path = os.path.join(base_upload_dir, excel_file.name)
+                    with open(current_excel_path, "wb") as f:
+                        f.write(excel_file.read())
+                    st.session_state.saved_excel_path = current_excel_path
                 
                 if csv_files:
-                    custom_raw_dir = os.path.join(base_upload_dir, "raw_charts")
-                    os.makedirs(custom_raw_dir, exist_ok=True)
+                    current_raw_dir = os.path.join(base_upload_dir, "raw_charts")
+                    os.makedirs(current_raw_dir, exist_ok=True)
                     for csv in csv_files:
-                        csv_path = os.path.join(custom_raw_dir, csv.name)
+                        csv.seek(0)
+                        csv_path = os.path.join(current_raw_dir, csv.name)
                         with open(csv_path, "wb") as f:
-                            f.write(csv.getbuffer())
-                    st.session_state.saved_raw_dir = custom_raw_dir  # 跨功能保留
-                    # 新 CSV 上傳時清除舊的 split 快取
+                            f.write(csv.read())
+                    st.session_state.saved_raw_dir = current_raw_dir
+                    
+                    # 上傳新 CSV 時，清除舊的 Split 記憶
                     st.session_state.saved_split_raw_dir = None
                     st.session_state.saved_split_id = None
+                    st.session_state.saved_split_info = None
 
-            # 自動偵測並拆分待拆格式（一次上傳整份 CSV + AllChart 即可）
-            auto_split_id      = None
-            auto_split_raw_dir = None
-            st.session_state.auto_split_info = None
-            
-            VENDOR_COLS = {"Part ID", "Item Name", "Report Time", "Lot Mean", "Vendor Site"}
-            TEST_H_COLS = {"Part ID", "FT Test End Time", "Test Site"}
-            TYPE2_COLS  = {"GroupName", "ChartName", "point_time", "point_val"}
-
-            if csv_files and len(csv_files) == 1 and custom_raw_dir:
-                first_saved = os.path.join(custom_raw_dir, csv_files[0].name)
+            # --- 2. 自動偵測與拆分 (僅在新上傳 CSV 時觸發) ---
+            if csv_files and len(csv_files) == 1 and current_raw_dir:
+                first_saved = os.path.join(current_raw_dir, csv_files[0].name)
                 try:
-                    # 1. 先讀取標準表頭來判斷 Vendor, Test_H, Type2
                     peek = pd.read_csv(first_saved, nrows=0)
                     detected_cols = set(peek.columns)
                     detected_split_mode = None
                     
-                    if VENDOR_COLS.issubset(detected_cols):
+                    if {"Part ID", "Item Name", "Report Time", "Lot Mean", "Vendor Site"}.issubset(detected_cols):
                         detected_split_mode = "Vendor_Vertical"
-                    elif TEST_H_COLS.issubset(detected_cols):
+                    elif {"Part ID", "FT Test End Time", "Test Site"}.issubset(detected_cols):
                         detected_split_mode = "Test_Horizontal"
-                    elif TYPE2_COLS.issubset(detected_cols):
+                    elif {"GroupName", "ChartName", "point_time", "point_val"}.issubset(detected_cols):
                         detected_split_mode = "Type2_Vertical"
                     else:
-                        # 2. 如果都不是，嘗試無表頭讀取前 3 列，偵測是否為 Type3_Horizontal (多層表頭)
                         peek_no_header = pd.read_csv(first_saved, nrows=3, header=None)
                         flat_vals = peek_no_header.iloc[0:2].fillna("").astype(str).values.flatten().tolist()
                         if any("GroupName" in val for val in flat_vals) and any("ChartName" in val for val in flat_vals):
                             detected_split_mode = "Type3_Horizontal"
 
-                    # 若有成功配對到任何一種模式，就呼叫後端進行自動拆分
                     if detected_split_mode:
                         split_resp = requests.post(
                             f"{API_BASE_URL}/split",
@@ -442,59 +436,50 @@ with col1:
                         )
                         if split_resp.status_code == 200:
                             split_result = split_resp.json()
-                            auto_split_id      = split_result.get("split_id")
-                            auto_split_raw_dir = split_result.get("raw_data_directory")
-                            st.session_state.saved_split_raw_dir = auto_split_raw_dir  # 跨功能保留
-                            st.session_state.saved_split_id = auto_split_id          # 跨功能保留
-                            st.session_state.auto_split_info = (
-                                f"🔀 自動偵測到 **{detected_split_mode}** 格式，"
-                                f"已完成拆分（{split_result.get('processed', 0)} 個 chart）"
-                            )
+                            st.session_state.saved_split_id = split_result.get("split_id")
+                            st.session_state.saved_split_raw_dir = split_result.get("raw_data_directory")
+                            st.session_state.saved_split_info = f"🔀 自動偵測到 **{detected_split_mode}** 格式，已完成拆分"
                         else:
-                            st.session_state.auto_split_info = (
-                                f"⚠️ 自動拆分失敗（HTTP {split_resp.status_code}），將以原始目錄繼續分析"
-                            )
-                except Exception:
-                    pass  # 偵測失敗就視為一般上傳，不影響原有流程
+                            st.error(f"⚠️ 自動拆分失敗（HTTP {split_resp.status_code}）")
+                except Exception as e:
+                    st.error(f"⚠️ 讀取或拆分檔案時發生錯誤：{str(e)}")
 
-            # 若本次沒有上傳新檔，沿用上一次儲存的路徑（切換功能時 file_uploader 會被清空）
-            if not custom_excel_path:
-                custom_excel_path = st.session_state.saved_excel_path
-            if not custom_raw_dir:
-                custom_raw_dir = st.session_state.saved_raw_dir
-            if not auto_split_raw_dir:
-                auto_split_raw_dir = st.session_state.saved_split_raw_dir
-            if not auto_split_id:
-                auto_split_id = st.session_state.saved_split_id
+            # --- 3. 如果本次沒有上傳，強制沿用 Session 中的舊檔案 ---
+            if not current_excel_path: current_excel_path = st.session_state.get("saved_excel_path")
+            if not current_raw_dir: current_raw_dir = st.session_state.get("saved_raw_dir")
+            
+            auto_split_id = st.session_state.get("saved_split_id")
+            auto_split_raw_dir = st.session_state.get("saved_split_raw_dir")
+            st.session_state.auto_split_info = st.session_state.get("saved_split_info")
 
-            # 組裝 API Payload
+            # --- 4. 防呆機制：如果真的沒檔案可送，擋住並警告 ---
+            if not current_excel_path and not current_raw_dir and not auto_split_raw_dir:
+                st.error("⚠️ 系統找不到分析資料，請重新上傳檔案！")
+                st.stop()
+
+            # --- 5. 組裝 API Payload ---
             payload = {}
             if mode == "OOB/SPC":
                 endpoint = "/process"
-                if custom_excel_path: payload["filepath"] = custom_excel_path
-                if auto_split_id:
-                    payload["split_id"] = auto_split_id
-                elif auto_split_raw_dir:
-                    payload["raw_data_directory"] = auto_split_raw_dir
-                elif custom_raw_dir:
-                    payload["raw_data_directory"] = custom_raw_dir
+                if current_excel_path: payload["filepath"] = current_excel_path
+                if auto_split_id: payload["split_id"] = auto_split_id
+                elif auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
+                elif current_raw_dir: payload["raw_data_directory"] = current_raw_dir
+                
             elif mode == "Tool Matching":
                 endpoint = "/tool-matching"
                 payload = {"base_date": base_date.strftime("%Y-%m-%d"), "filter_mode": "specified_date"}
-                if custom_excel_path: payload["chart_excel_path"] = custom_excel_path
-                if auto_split_raw_dir:
-                    payload["raw_data_directory"] = auto_split_raw_dir
-                elif custom_raw_dir:
-                    payload["raw_data_directory"] = custom_raw_dir
+                if current_excel_path: payload["chart_excel_path"] = current_excel_path
+                if auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
+                elif current_raw_dir: payload["raw_data_directory"] = current_raw_dir
+                
             else: # CPK Dashboard
                 endpoint = "/spc-cpk"
                 payload = {"end_date": base_date.strftime("%Y-%m-%d")}
-                if custom_excel_path: payload["chart_excel_path"] = custom_excel_path
-                if auto_split_raw_dir:
-                    payload["raw_data_directory"] = auto_split_raw_dir
-                elif custom_raw_dir:
-                    payload["raw_data_directory"] = custom_raw_dir
-            
+                if current_excel_path: payload["chart_excel_path"] = current_excel_path
+                if auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
+                elif current_raw_dir: payload["raw_data_directory"] = current_raw_dir
+
             # 先儲存參數並關閉彈窗，重繪後再送出 API
             st.session_state.pending_mode = mode
             st.session_state.pending_endpoint = endpoint
@@ -526,10 +511,12 @@ with col3:
         st.session_state.results = None
         st.session_state.progress = 0
         st.session_state.full_excel_data = None
-        st.session_state.saved_excel_path = None
-        st.session_state.saved_raw_dir = None
-        st.session_state.saved_split_raw_dir = None
-        st.session_state.saved_split_id = None
+        st.session_state.auto_split_info = None
+        # 保留 saved_* 檔案記憶，不清除，讓切換功能或重跑時不需重新上傳
+        # st.session_state.saved_excel_path = None
+        # st.session_state.saved_raw_dir = None
+        # st.session_state.saved_split_raw_dir = None
+        # st.session_state.saved_split_id = None
         st.rerun()
 
 with col4:
