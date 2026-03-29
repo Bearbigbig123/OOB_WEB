@@ -1535,7 +1535,7 @@ def analyze_spc_cpk(request: SPCCpkRequest, background_tasks: BackgroundTasks) -
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/health")
-def health() -> Dict[str, str]:
+async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 @app.get("/")

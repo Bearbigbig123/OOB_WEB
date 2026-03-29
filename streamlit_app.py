@@ -8,7 +8,224 @@ from datetime import datetime
 import io
 import zipfile
 import os
+import uuid
 from PIL import Image
+
+
+# ============================================================
+# 本地 CSV 拆分模組（不依賴後端 API）
+# ============================================================
+
+def _sanitize_fn(name: str) -> str:
+    """移除檔名中的非法字元。"""
+    for ch in '<>:"/\\|?*\'':
+        name = name.replace(ch, "")
+    return name.strip()
+
+
+def _read_csv_bytes(data: bytes, header_val=None) -> pd.DataFrame:
+    """嘗試多種編碼讀取 CSV bytes，回傳 DataFrame。"""
+    encodings = ["utf-8-sig", "utf-8", "big5", "cp950", "latin1", "cp1252"]
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(io.BytesIO(data), header=header_val, encoding=enc)
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"無法以任何已知編碼讀取 CSV：{last_err}")
+
+
+def _ui_split_type3_horizontal(data: bytes, filename: str, output_folder: str) -> bool:
+    try:
+        df = _read_csv_bytes(data, header_val=None)
+        new_columns = []
+        for col1, col2 in zip(df.iloc[0], df.iloc[1]):
+            if pd.isna(col2):
+                new_columns.append(str(col1))
+            elif pd.isna(col1):
+                new_columns.append(str(col2))
+            else:
+                new_columns.append(f"{col1}_{col2}")
+        df = df.iloc[2:].copy()
+        df.columns = new_columns
+
+        chartname_col_name = None
+        for col in df.columns:
+            if "GroupName" in col and "ChartName" in col:
+                chartname_col_name = col
+                break
+        if chartname_col_name is None:
+            raise ValueError("找不到合併的 GroupName/ChartName 標頭欄")
+
+        chartname_idx = df.columns.get_loc(chartname_col_name)
+        universal_info_columns = df.columns[: chartname_idx + 1].tolist()
+        chart_columns = df.columns[chartname_idx + 1:]
+
+        for chart_col in chart_columns:
+            temp_df = df[universal_info_columns].copy()
+            temp_df["point_val"] = df[chart_col]
+            groupname, chartname = (chart_col.split("_", 1) if "_" in chart_col else ("", chart_col))
+            temp_df["GroupName"] = groupname
+            temp_df["ChartName"] = chartname
+            if "point_time" in temp_df.columns:
+                try:
+                    temp_df["point_time"] = pd.to_datetime(temp_df["point_time"], errors="coerce")\
+                        .dt.strftime("%Y/%m/%d %H:%M")
+                except Exception:
+                    pass
+            final_columns_order = ["GroupName", "ChartName", "point_time", "point_val"]
+            for col in universal_info_columns:
+                if col not in final_columns_order and col != chartname_col_name:
+                    final_columns_order.append(col)
+            existing_cols = [c for c in final_columns_order if c in temp_df.columns]
+            temp_df = temp_df[existing_cols]
+            out = os.path.join(output_folder, f"{_sanitize_fn(groupname)}_{_sanitize_fn(chartname)}.csv")
+            if not temp_df.empty:
+                temp_df.to_csv(out, index=False, encoding="utf-8-sig")
+        return True
+    except Exception as e:
+        print(f"[UI Split] Type3 failed for {filename}: {e}")
+        return False
+
+
+def _ui_split_type2_vertical(data: bytes, filename: str, output_folder: str) -> bool:
+    try:
+        df = _read_csv_bytes(data, header_val="infer")
+        required_cols = ["GroupName", "ChartName", "point_time", "point_val"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"缺少欄位：{', '.join(missing)}")
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce")\
+                    .dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        for _, row in df[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            gn, cn = row["GroupName"], row["ChartName"]
+            temp_df = df[(df["GroupName"] == gn) & (df["ChartName"] == cn)].copy()
+            other = [c for c in temp_df.columns if c not in required_cols]
+            temp_df = temp_df[required_cols + other]
+            out = os.path.join(output_folder, f"{_sanitize_fn(str(gn))}_{_sanitize_fn(str(cn))}.csv")
+            if not temp_df.empty:
+                temp_df.to_csv(out, index=False, encoding="utf-8-sig")
+        return True
+    except Exception as e:
+        print(f"[UI Split] Type2 failed for {filename}: {e}")
+        return False
+
+
+def _ui_split_vendor_vertical(data: bytes, filename: str, output_folder: str) -> bool:
+    try:
+        df = _read_csv_bytes(data, header_val="infer")
+        vendor_col_map = {
+            "Part ID": "GroupName", "Item Name": "ChartName",
+            "Report Time": "point_time", "Lot Mean": "point_val", "Vendor Site": "Matching",
+        }
+        missing = [src for src in vendor_col_map if src not in df.columns]
+        if missing:
+            raise ValueError(f"缺少廠商欄位：{', '.join(missing)}")
+        df = df.rename(columns=vendor_col_map)
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce")\
+                    .dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        required_cols = ["GroupName", "ChartName", "point_time", "point_val"]
+        for _, row in df[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            gn, cn = row["GroupName"], row["ChartName"]
+            temp_df = df[(df["GroupName"] == gn) & (df["ChartName"] == cn)].copy()
+            other = [c for c in temp_df.columns if c not in required_cols]
+            temp_df = temp_df[required_cols + other]
+            out = os.path.join(output_folder, f"{_sanitize_fn(str(gn))}_{_sanitize_fn(str(cn))}.csv")
+            if not temp_df.empty:
+                temp_df.to_csv(out, index=False, encoding="utf-8-sig")
+        return True
+    except Exception as e:
+        print(f"[UI Split] Vendor failed for {filename}: {e}")
+        return False
+
+
+def _ui_split_test_horizontal(data: bytes, filename: str, output_folder: str) -> bool:
+    try:
+        df = _read_csv_bytes(data, header_val="infer")
+        test_col_map = {
+            "Part ID": "GroupName",
+            "FT Test End Time": "point_time",
+            "Test Site": "Matching",
+        }
+        missing = [src for src in test_col_map if src not in df.columns]
+        if missing:
+            raise ValueError(f"缺少測試欄位：{', '.join(missing)}")
+        df = df.rename(columns=test_col_map)
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce")\
+                    .dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        matching_idx = df.columns.get_loc("Matching")
+        id_cols = df.columns[:matching_idx + 1].tolist()
+        value_cols = df.columns[matching_idx + 1:].tolist()
+        if not value_cols:
+            raise ValueError("Matching 欄位之後沒有測試項目欄位")
+        df_melted = df.melt(id_vars=id_cols, value_vars=value_cols,
+                            var_name="ChartName", value_name="point_val")\
+                      .dropna(subset=["point_val"])
+        standard_cols = ["GroupName", "ChartName", "point_time", "point_val", "Matching"]
+        for _, row in df_melted[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            gn, cn = row["GroupName"], row["ChartName"]
+            temp_df = df_melted[(df_melted["GroupName"] == gn) & (df_melted["ChartName"] == cn)].copy()
+            existing = [c for c in standard_cols if c in temp_df.columns]
+            temp_df = temp_df[existing]
+            out = os.path.join(output_folder, f"{_sanitize_fn(str(gn))}_{_sanitize_fn(str(cn))}.csv")
+            if not temp_df.empty:
+                temp_df.to_csv(out, index=False, encoding="utf-8-sig")
+        return True
+    except Exception as e:
+        print(f"[UI Split] Test_Horizontal failed for {filename}: {e}")
+        return False
+
+
+def _local_split_files(uploaded_files, split_mode: str) -> dict:
+    """
+    在 Streamlit 進程內執行 CSV 拆分。
+    回傳 dict: {success, split_dir, processed, failed, csv_count}
+    """
+    split_id = uuid.uuid4().hex
+    split_dir = os.path.abspath(os.path.join("temp_uploads", split_id, "split_data"))
+    os.makedirs(split_dir, exist_ok=True)
+
+    successes = 0
+    failures = []
+    _dispatch = {
+        "Type3_Horizontal": _ui_split_type3_horizontal,
+        "Type2_Vertical":   _ui_split_type2_vertical,
+        "Vendor_Vertical":  _ui_split_vendor_vertical,
+        "Test_Horizontal":  _ui_split_test_horizontal,
+    }
+    fn = _dispatch.get(split_mode)
+    for uf in uploaded_files:
+        data = uf.read()
+        try:
+            ok = fn(data, uf.name, split_dir) if fn else False
+        except Exception as e:
+            failures.append(f"{uf.name}: {e}")
+            continue
+        if ok:
+            successes += 1
+        else:
+            failures.append(uf.name)
+
+    csv_count = len([f for f in os.listdir(split_dir) if f.endswith(".csv")])
+    return {
+        "success": csv_count > 0,
+        "split_dir": split_dir,
+        "processed": successes,
+        "failed": failures,
+        "csv_count": csv_count,
+    }
 
 # 嘗試載入 AG Grid，如果無法載入則使用標準 dataframe
 try:
@@ -133,10 +350,15 @@ def init_session_state():
     """初始化 session state"""
     if 'api_connected' not in st.session_state:
         st.session_state.api_connected = False
+    if '_api_checked' not in st.session_state:
+        st.session_state._api_checked = False
     if 'split_results' not in st.session_state:
         st.session_state.split_results = None
     if 'split_status' not in st.session_state:
         st.session_state.split_status = None
+    # 本地拆分結果路徑（取代舊的 API split_status 機制）
+    if 'local_split_dir' not in st.session_state:
+        st.session_state.local_split_dir = None
     if 'oob_results' not in st.session_state:
         st.session_state.oob_results = None
     if 'tool_matching_results' not in st.session_state:
@@ -507,98 +729,99 @@ def save_uploaded_file(uploaded_file, directory: str) -> str:
     return file_path
 
 def render_split_chart_page():
-    """Split Chart 分頁"""
-    
-    if not st.session_state.api_connected:
-        st.warning("⚠️ 後台 API 未連線，無法進行 Split Chart 處理")
-        return
-    
+    """Split Chart 分頁 — 本地執行，不依賴後端 API"""
+
     st.markdown("## 📊 CSV 檔案分割工具")
-    st.markdown("將複合格式的 CSV 檔案分割成個別chart的獨立檔案，方便後續的 SPC 分析處理。")
-    
-    # 分割模式選擇
+    st.markdown("將複合格式的 CSV 檔案分割成個別 chart 的獨立檔案，方便後續的 SPC 分析處理。")
+
+    # ── 已有拆分結果時顯示摘要 ──────────────────────────────────────
+    local_split_dir = st.session_state.get('local_split_dir')
+    if local_split_dir and os.path.isdir(local_split_dir):
+        csv_list = [f for f in os.listdir(local_split_dir) if f.endswith(".csv")]
+        csv_count = len(csv_list)
+        st.success(f"🎯 **已有拆分結果：{csv_count} 個 CSV 檔案**，可直接切換至分析頁面使用。")
+        col_info, col_dl, col_clr = st.columns([3, 1, 1])
+        with col_info:
+            st.info(f"📁 路徑：`{local_split_dir}`")
+        with col_dl:
+            # 打包成 ZIP 供下載
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for fname in csv_list:
+                    zf.write(os.path.join(local_split_dir, fname), arcname=fname)
+            zip_buf.seek(0)
+            st.download_button(
+                "📦 下載 ZIP",
+                data=zip_buf,
+                file_name=f"split_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with col_clr:
+            if st.button("🗑️ 清除", help="清除本次拆分結果，回到手動上傳模式",
+                         key="split_page_clear", use_container_width=True):
+                st.session_state.local_split_dir = None
+                st.rerun()
+        st.markdown("---")
+
+    # ── 分割設定 + 上傳 ───────────────────────────────────────────
     col1, col2 = st.columns([0.8, 1])
-    
+
     with col1:
         st.markdown("### 🔧 分割設定")
-        
         split_mode = st.selectbox(
             "選擇分割模式",
             ["Type3_Horizontal", "Type2_Vertical", "Vendor_Vertical", "Test_Horizontal"],
-            help="Type3_Horizontal: 橫向資料格式，多個chart在不同欄位\nType2_Vertical: 縱向資料格式，所有chart在同一檔案透過 GroupName 和 ChartName 區分\nVendor_Vertical: 廠商格式，欄位 Part ID / Item Name / Report Time / Lot Mean / Vendor Site 自動對應標準欄位\nTest_Horizontal: 測試橫向格式，Part ID / FT Test End Time / Test Site 後接水平測試項目欄位，自動 melt 轉換"
+            help=(
+                "Type3_Horizontal: 橫向資料格式，多個 chart 在不同欄位\n"
+                "Type2_Vertical: 縱向資料格式，透過 GroupName/ChartName 區分\n"
+                "Vendor_Vertical: 廠商格式，自動對應 Part ID / Item Name / Report Time / Lot Mean / Vendor Site\n"
+                "Test_Horizontal: 測試橫向格式，Part ID / FT Test End Time / Test Site 後接水平測試項目"
+            ),
         )
-        
-        # 輸出資料夾設定（暫時關閉）
-        # output_folder = st.text_input(
-        #     "輸出資料夾 (可選)",
-        #     value="",
-        #     placeholder="預設為 input 資料夾",
-        #     help="分割後的檔案將儲存在此資料夾下的 raw_charts 子目錄中。留空則使用預設的 input 資料夾"
-        # )
-        
-        # 固定使用預設的 input 資料夾
-        output_folder = ""
-        st.info("🗂️ 分割結果將自動儲存到 `input/raw_charts/` 資料夾")
-    
+        st.info("🗂️ 拆分在瀏覽器端本地執行，結果存於記憶體，後續分析頁面可直接引用。")
+
     with col2:
         st.markdown("### 📁 檔案上傳")
-        
-        # 檔案上傳
         uploaded_files = st.file_uploader(
             "選擇要分割的 CSV 檔案",
-            type=['csv'],
+            type=["csv"],
             accept_multiple_files=True,
-            help="可以同時上傳多個 CSV 檔案進行批次處理"
+            help="可同時上傳多個 CSV 檔案進行批次處理",
         )
-        
         if uploaded_files:
-            # 檔案狀態和執行按鈕放在同一行
             file_col, button_col = st.columns([2, 1])
-            
             with file_col:
                 st.success(f"✅ 已選擇 {len(uploaded_files)} 個檔案")
-            
             with button_col:
-                # 執行分割按鈕 - 移到這裡更順手
-                if st.button("🚀 開始分割", type="primary", disabled=not uploaded_files, key="split_button_main"):
-                    # 執行分割邏輯將在這裡處理
+                if st.button("🚀 開始分割", type="primary",
+                             disabled=not uploaded_files, key="split_button_main"):
                     st.session_state.trigger_split = True
-            
-            # 顯示檔案列表
-            # with st.expander("📋 檔案列表", expanded=True):
-            #     for i, file in enumerate(uploaded_files, 1):
-            #         st.write(f"{i}. {file.name} ({file.size:,} bytes)")
         else:
-            # 沒有檔案時顯示提示
             st.info("📤 請選擇要分割的 CSV 檔案")
-    
-    # 分割模式說明
+
+    # ── 分割模式說明 ─────────────────────────────────────────────
     st.markdown("### 📖 分割模式說明")
-    
     mode_col1, mode_col2 = st.columns(2)
-    
     with mode_col1:
         st.markdown("""
         **Type3_Horizontal (橫向分割)**
         - 適用於橫向資料格式
-        - 多個chart的資料在同一檔案的不同欄位
+        - 多個 chart 的資料在同一檔案的不同欄位
         - 前兩行作為複合標題處理
         - 需要包含 'GroupName' 和 'ChartName' 的欄位
         """)
-    
     with mode_col2:
         st.markdown("""
         **Type2_Vertical (縱向分割)**
         - 適用於縱向資料格式
-        - 所有chart資料在同一檔案
-        - 透過 GroupName 和 ChartName 區分不同chart
+        - 所有 chart 資料在同一檔案
+        - 透過 GroupName 和 ChartName 區分不同 chart
         - 需要標準欄位：GroupName、ChartName、point_time、point_val
         """)
-
     if split_mode == "Vendor_Vertical":
         st.info("""
-        **Vendor_Vertical (廠商縱向格式)**  
-        適用於廠商提供的標準報表格式，系統將自動進行欄位對應：
+        **Vendor_Vertical (廠商縱向格式)**
         | 原始欄位 | 對應標準欄位 |
         |---|---|
         | Part ID | GroupName |
@@ -607,11 +830,9 @@ def render_split_chart_page():
         | Lot Mean | point_val |
         | Vendor Site | Matching |
         """)
-
     if split_mode == "Test_Horizontal":
         st.info("""
-        **Test_Horizontal (測試橫向格式)**  
-        適用於 FT 測試報表，固定欄位後接水平展開的測試項目，系統自動 melt 轉為縱向格式：
+        **Test_Horizontal (測試橫向格式)**
         | 原始欄位 | 對應標準欄位 |
         |---|---|
         | Part ID | GroupName |
@@ -619,114 +840,60 @@ def render_split_chart_page():
         | Test Site | Matching |
         | （其後所有欄位） | ChartName（欄名）/ point_val（值） |
         """)
-    
-    # 處理分割執行邏輯
-    if hasattr(st.session_state, 'trigger_split') and st.session_state.trigger_split and uploaded_files:
-        st.session_state.trigger_split = False  # 重置觸發狀態
-        
-        # 儲存上傳的檔案到暫存目錄
-        temp_dir = "temp_uploads"
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        input_file_paths = []
-        for uploaded_file in uploaded_files:
-            temp_path = os.path.join(temp_dir, uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            input_file_paths.append(os.path.abspath(temp_path))
-        
-        # 準備 API 請求資料
-        request_data = {
-            "mode": split_mode,
-            "input_files": input_file_paths
-        }
-        
-        # 只有在指定輸出資料夾時才加入 output_folder 參數
-        if output_folder.strip():
-            request_data["output_folder"] = output_folder.strip()
-        
-        # 顯示處理進度
-        with st.spinner(f"正在使用 {split_mode} 模式分割 {len(uploaded_files)} 個檔案..."):
-            result = APIClient.split_charts(request_data)
-        
-        if result:
-            # 顯示處理結果
-            st.success("✅ 檔案分割完成！")
-            
-            # 結果摘要
-            col_res1, col_res2, col_res3 = st.columns(3)
-            
-            with col_res1:
-                st.metric("處理模式", result.get("mode", "未知"))
-            
-            with col_res2:
-                st.metric("成功處理", f"{result.get('processed', 0)} 個檔案")
-            
-            with col_res3:
-                failed_count = len(result.get('failed', []))
-                st.metric("處理失敗", f"{failed_count} 個檔案")
-            
-            # 輸出資料夾資訊
-            output_path = result.get("output_folder", "")
-            if output_path:
-                st.info(f"📁 輸出資料夾：`{output_path}`")
-            
-            # 智能提示：如果分割成功，提醒用戶可以直接使用 OOB 功能
-            if result.get("remembered_for_oob", False):
-                st.success("🎉 **分割完成！現在您可以直接到 'OOB/SPC 分析' 分頁，只需要上傳 Chart Information 檔案，Raw Data 將自動使用剛才分割的結果！**")
-            
-            # 失敗檔案詳情
-            if result.get('failed'):
-                with st.expander("❌ 處理失敗的檔案", expanded=True):
-                    for failed_file in result['failed']:
-                        st.error(f"• {failed_file}")
-            
-            # 清理暫存檔案
-            try:
-                for temp_path in input_file_paths:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-            except Exception as e:
-                st.warning(f"⚠️ 清理暫存檔案時發生錯誤：{e}")
-        
+
+    # ── 執行拆分（本地，不呼叫 API）────────────────────────────────
+    if getattr(st.session_state, 'trigger_split', False) and uploaded_files:
+        st.session_state.trigger_split = False
+
+        with st.spinner("正在自動準備資料夾..."):
+            result = _local_split_files(uploaded_files, split_mode)
+
+        if result["success"]:
+            st.session_state.local_split_dir = result["split_dir"]
+            st.success(
+                f"✅ 分割完成！處理 {result['processed']} 個輸入檔，"
+                f"產生 **{result['csv_count']}** 個 CSV 檔案。"
+            )
+            if result["failed"]:
+                with st.expander("⚠️ 部分檔案處理失敗", expanded=True):
+                    for f in result["failed"]:
+                        st.error(f"• {f}")
+            st.info("🎉 已記憶拆分結果，請切換至 **OOB/SPC 分析** 或 **SPC CPK Dashboard** 頁面繼續。")
+            st.rerun()
         else:
-            st.error("❌ 檔案分割失敗，請檢查後台服務狀態")
+            st.error(
+                f"❌ 拆分失敗，未產生任何 CSV 檔案。\n"
+                f"失敗清單：{result['failed']}"
+            )
 
 def render_oob_page():
     """OOB 分析分頁"""
-    
+
     if not st.session_state.api_connected:
         st.warning("⚠️ 後台 API 未連線，無法進行分析")
         return
-    
-    # 檢查分割狀態
-    split_status = APIClient.get_split_status()
-    st.session_state.split_status = split_status
-    
-    # 顯示分割狀態資訊
-    if split_status and split_status.get("has_split_data", False):
+
+    # 讀取本地拆分路徑（取代舊的 API split_status 機制）
+    local_split_dir = st.session_state.get('local_split_dir')
+
+    # 顯示拆分狀態資訊
+    if local_split_dir and os.path.isdir(local_split_dir):
+        csv_count = len([f for f in os.listdir(local_split_dir) if f.endswith('.csv')])
         with st.container():
-            st.success(f"🎯 **已偵測到分割的 Raw Data！** ({split_status.get('csv_file_count', 0)} 個 CSV 檔案)")
-            col_status1, col_status2, col_status3 = st.columns([2, 1, 1])
-            
+            st.success(f"🎯 **已偵測到拆分的 Raw Data！** ({csv_count} 個 CSV 檔案)")
+            col_status1, col_status2 = st.columns([3, 1])
             with col_status1:
-                st.info(f"📁 資料夾：`{split_status.get('split_folder', '')}`")
-            
+                st.info(f"📁 資料夾：`{local_split_dir}`")
             with col_status2:
-                if st.button("🔄 重新檢查", help="重新檢查分割狀態"):
+                if st.button("🗑️ 清除記憶", help="清除記住的拆分資料夾，回到手動上傳模式",
+                             key="oob_clear_split"):
+                    st.session_state.local_split_dir = None
                     st.rerun()
-            
-            with col_status3:
-                if st.button("🗑️ 清除記憶", help="清除記住的分割資料夾，回到手動上傳模式"):
-                    APIClient.clear_split_memory()
-                    st.success("✅ 已清除分割記憶")
-                    st.rerun()
-            
             st.markdown("---")
-    
+
     # 頂部控制欄 - 使用彈窗設定
     col_header1, col_header2, col_header3 = st.columns([1, 2, 1])
-    
+
     with col_header1:
         # 檔案設定彈窗按鈕
         st.markdown("<br>", unsafe_allow_html=True)  # 添加一些間距
@@ -737,7 +904,8 @@ def render_oob_page():
                 st.markdown("**📋 檔案上傳設定**")
             with col_close:
                 st.markdown("*點擊外部關閉*", help="點擊彈窗外的任何地方即可關閉此設定窗口")
-            
+
+
             st.divider()
             
             # 使用橫向排版
@@ -754,29 +922,30 @@ def render_oob_page():
                     st.error("❌ 未上傳 Chart Info 檔案")
             
             with col_upload2:
-                # 根據分割狀態決定是否顯示 Raw Data 上傳
-                has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
-                
+                # 根據本地拆分狀態決定是否顯示 Raw Data 上傳
+                has_split_data = bool(
+                    st.session_state.get('local_split_dir') and
+                    os.path.isdir(st.session_state.get('local_split_dir', ''))
+                )
+
                 if has_split_data:
                     st.write("**📁 原始資料檔案 (CSV)**")
-                    st.success("✅ 將自動使用分割的 Raw Data")
-                    st.info("無需手動上傳，已自動偵測分割結果")
+                    st.success("✅ 將自動使用拆分的 Raw Data")
+                    st.info("無需手動上傳，已自動偵測拆分結果")
                     raw_data_files = None  # 不需要上傳
                 else:
                     st.write("**📁 原始資料檔案 (CSV)**")
                     raw_data_files = render_file_uploader_with_filter("raw_data", accept_multiple_files=True, file_types=['csv'], title="上傳多個 CSV 檔案")
-                
+
                 # 檔案狀態檢查
                 if raw_data_files:
-                    # 如果檔案數量少於等於5個，或者沒有篩選功能啟用，顯示完整清單
                     if len(raw_data_files) <= 5:
                         st.success(f"✅ {len(raw_data_files)} 個檔案")
                         for file in raw_data_files:
                             st.write(f"✅ {file.name}")
                     else:
                         st.success(f"✅ 已上傳 {len(raw_data_files)} 個檔案")
-                        # 篩選功能已在 render_file_uploader_with_filter 中處理
-                else:
+                elif not has_split_data:
                     st.warning("⚠️ 未上傳原始資料檔案")
             
             # 使用預設參數
@@ -794,47 +963,49 @@ def render_oob_page():
         st.markdown("<br>", unsafe_allow_html=True)  # 添加一些間距
         
         # 檢查是否可以執行分析
-        has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
+        has_split_data = bool(
+            st.session_state.get('local_split_dir') and
+            os.path.isdir(st.session_state.get('local_split_dir', ''))
+        )
         can_analyze = chart_info_file is not None and (has_split_data or raw_data_files)
-        
+
         if st.button("🚀 開始分析", key="oob_analyze", type="primary", disabled=not can_analyze):
             if chart_info_file is None:
                 st.error("❌ 請先在設定中上傳 Chart Information 檔案")
                 return
-            
-            # 儲存檔案
-            temp_dir = "temp_uploads"
+
+            # 儲存 chart info 檔案（使用絕對路徑確保跨進程一致性）
+            temp_dir = os.path.abspath("temp_uploads")
             chart_info_path = save_uploaded_file(chart_info_file, temp_dir)
-            
-            # 檢查是否有分割的資料
-            has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
-            
-            # 處理原始資料檔案
+
+            # 確定 raw_data_directory
+            has_split_data = bool(
+                st.session_state.get('local_split_dir') and
+                os.path.isdir(st.session_state.get('local_split_dir', ''))
+            )
+
             raw_data_dir = None
             if has_split_data:
-                # 使用分割的資料夾，不需要上傳檔案
-                raw_data_dir = None  # 讓後台使用記住的分割資料夾
-                st.info("🎯 使用分割的 Raw Data 進行分析...")
+                # 使用本地拆分的絕對路徑，直接傳給後端
+                raw_data_dir = st.session_state.local_split_dir
+                st.info("🎯 使用拆分的 Raw Data 進行分析...")
             elif raw_data_files:
-                # 傳統上傳模式
-                raw_data_dir = os.path.join(temp_dir, "raw_charts")
+                # 傳統上傳模式：儲存到 temp 並取得絕對路徑
+                raw_data_dir = os.path.abspath(os.path.join(temp_dir, "raw_charts"))
                 for file in raw_data_files:
                     save_uploaded_file(file, raw_data_dir)
             else:
                 st.error("❌ 請上傳 Raw Data 檔案或先使用 Split Chart 功能")
                 return
-            
+
             # 準備 API 請求資料
             request_data = {
                 "filepath": chart_info_path,
                 "save_excel": save_excel,
                 "scale_factor": scale_factor,
-                "limit_charts": limit_charts
+                "limit_charts": limit_charts,
+                "raw_data_directory": raw_data_dir,
             }
-            
-            # 只有在有手動上傳的資料時才指定 raw_data_directory
-            if raw_data_dir:
-                request_data["raw_data_directory"] = raw_data_dir
             
             # 顯示處理中狀態
             with st.spinner("正在處理分析..."):
@@ -1536,34 +1707,27 @@ def render_tool_matching_page():
 
 def render_spc_cpk_page():
     """渲染 SPC CPK Dashboard 頁面"""
-    
+
     if not st.session_state.api_connected:
         st.warning("⚠️ 後台 API 未連線，無法進行分析")
         return
-    
-    # 檢查分割狀態
-    split_status = APIClient.get_split_status()
-    st.session_state.split_status = split_status
-    
-    # 顯示分割狀態資訊
-    if split_status and split_status.get("has_split_data", False):
+
+    # 讀取本地拆分路徑
+    local_split_dir = st.session_state.get('local_split_dir')
+
+    # 顯示拆分狀態資訊
+    if local_split_dir and os.path.isdir(local_split_dir):
+        csv_count = len([f for f in os.listdir(local_split_dir) if f.endswith('.csv')])
         with st.container():
-            st.success(f"🎯 **已偵測到分割的 Raw Data！** ({split_status.get('csv_file_count', 0)} 個 CSV 檔案)")
-            col_status1, col_status2, col_status3 = st.columns([2, 1, 1])
-            
+            st.success(f"🎯 **已偵測到拆分的 Raw Data！** ({csv_count} 個 CSV 檔案)")
+            col_status1, col_status2 = st.columns([3, 1])
             with col_status1:
-                st.info(f"📁 資料夾：`{split_status.get('split_folder', '')}`")
-            
+                st.info(f"📁 資料夾：`{local_split_dir}`")
             with col_status2:
-                if st.button("🔄 重新檢查", help="重新檢查分割狀態", key="spc_cpk_refresh"):
+                if st.button("🗑️ 清除記憶", help="清除記住的拆分資料夾，回到手動上傳模式",
+                             key="spc_cpk_clear"):
+                    st.session_state.local_split_dir = None
                     st.rerun()
-            
-            with col_status3:
-                if st.button("🗑️ 清除記憶", help="清除記住的分割資料夾，回到手動上傳模式", key="spc_cpk_clear"):
-                    APIClient.clear_split_memory()
-                    st.success("✅ 已清除分割記憶")
-                    st.rerun()
-            
             st.markdown("---")
     
     # 頂部控制欄 - 使用彈窗設定
@@ -1596,28 +1760,29 @@ def render_spc_cpk_page():
                     st.error("❌ 未上傳 Chart Info 檔案")
             
             with col_upload2:
-                # 根據分割狀態決定是否顯示 Raw Data 上傳
-                has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
-                
+                # 根據本地拆分狀態決定是否顯示 Raw Data 上傳
+                has_split_data = bool(
+                    st.session_state.get('local_split_dir') and
+                    os.path.isdir(st.session_state.get('local_split_dir', ''))
+                )
+
                 if has_split_data:
                     st.write("**📁 原始資料檔案 (CSV)**")
-                    st.success("✅ 將自動使用分割的 Raw Data")
-                    st.info("無需手動上傳，已自動偵測分割結果")
-                    raw_data_files = None  # 不需要上傳
+                    st.success("✅ 將自動使用拆分的 Raw Data")
+                    st.info("無需手動上傳，已自動偵測拆分結果")
+                    raw_data_files = None
                 else:
                     st.write("**📁 原始資料檔案 (CSV)**")
                     raw_data_files = render_file_uploader_with_filter("spc_raw_data", accept_multiple_files=True, file_types=['csv'], title="上傳多個 CSV 檔案")
-                
+
                 # 檔案狀態檢查
                 if raw_data_files:
-                    # 如果檔案數量少於等於5個，或者沒有篩選功能啟用，顯示完整清單
                     if len(raw_data_files) <= 5:
                         st.success(f"✅ {len(raw_data_files)} 個檔案")
                         for file in raw_data_files:
                             st.write(f"✅ {file.name}")
                     else:
                         st.success(f"✅ 已上傳 {len(raw_data_files)} 個檔案")
-                        # 篩選功能已在 render_file_uploader_with_filter 中處理
                 elif not has_split_data:
                     st.warning("⚠️ 未上傳原始資料檔案")
             
@@ -1665,49 +1830,49 @@ def render_spc_cpk_page():
         st.markdown("<br>", unsafe_allow_html=True)  # 添加一些間距
         
         # 檢查是否可以執行分析
-        has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
+        has_split_data = bool(
+            st.session_state.get('local_split_dir') and
+            os.path.isdir(st.session_state.get('local_split_dir', ''))
+        )
         can_analyze = chart_info_file is not None and (has_split_data or raw_data_files)
-        
+
         if st.button("🚀 開始分析", key="spc_cpk_analyze", type="primary", disabled=not can_analyze):
-            # 檢查檔案上傳
             if chart_info_file is None:
                 st.error("❌ 請先在設定中上傳 Chart Information 檔案")
                 return
-            
-            # 儲存檔案
-            temp_dir = "temp_uploads"
+
+            # 儲存 chart info 檔案（使用絕對路徑確保跨進程一致性）
+            temp_dir = os.path.abspath("temp_uploads")
             chart_excel_path = save_uploaded_file(chart_info_file, temp_dir)
-            
-            # 檢查是否有分割的資料
-            has_split_data = st.session_state.split_status and st.session_state.split_status.get("has_split_data", False)
-            
-            # 處理原始資料檔案
+
+            # 確定 raw_data_directory
+            has_split_data = bool(
+                st.session_state.get('local_split_dir') and
+                os.path.isdir(st.session_state.get('local_split_dir', ''))
+            )
+
             raw_data_directory = None
             if has_split_data:
-                # 使用分割的資料夾，不需要上傳檔案
-                raw_data_directory = None  # 讓後台使用記住的分割資料夾
-                st.info("🎯 使用分割的 Raw Data 進行 SPC CPK 分析...")
+                # 使用本地拆分的絕對路徑，直接傳給後端
+                raw_data_directory = st.session_state.local_split_dir
+                st.info("🎯 使用拆分的 Raw Data 進行 SPC CPK 分析...")
             elif raw_data_files:
-                # 傳統上傳模式
-                raw_data_directory = os.path.join(temp_dir, "raw_charts")
+                raw_data_directory = os.path.abspath(os.path.join(temp_dir, "raw_charts"))
                 for file in raw_data_files:
                     save_uploaded_file(file, raw_data_directory)
             else:
                 st.error("❌ 請上傳 Raw Data 檔案或先使用 Split Chart 功能")
                 return
-            
-            # 準備請求資料
+
+            # 準備請求資料（raw_data_directory 必須傳遞）
             request_data = {
                 "chart_excel_path": chart_excel_path,
                 "start_date": start_date.isoformat() if start_date else None,
                 "end_date": end_date.isoformat() if end_date else None,
                 "custom_mode": custom_mode,
-                "selected_chart": selected_chart if selected_chart.strip() else None
+                "selected_chart": selected_chart if selected_chart.strip() else None,
+                "raw_data_directory": raw_data_directory,
             }
-            
-            # 只有在有手動上傳的資料時才指定 raw_data_directory
-            if raw_data_directory:
-                request_data["raw_data_directory"] = raw_data_directory
             
             # 顯示分析進度
             with st.spinner("🔄 正在執行 SPC CPK 分析..."):
@@ -1934,13 +2099,23 @@ def main():
     if not st.session_state.logged_in:
         show_login_page()
         return
-    
+
     # 標題和導航
     st.title("OSAT SPC System")
     st.markdown("---")
-    
-    # 檢查 API 連線狀態
-    check_api_connection()
+
+    # 健康檢查：每個 session 只在第一次載入時執行，避免因 thread starvation
+    # 造成後端重負載期間 health check 超時而讓 UI 閃退
+    if not st.session_state._api_checked:
+        check_api_connection()
+        st.session_state._api_checked = True
+    else:
+        # 後續 render 沿用上次的狀態，但在 sidebar 補充顯示當前值
+        if st.session_state.api_connected:
+            st.sidebar.success("🟢 後台 API 連線正常")
+        else:
+            st.sidebar.error("🔴 後台 API 連線失敗")
+            st.sidebar.info("請確保後台服務正在運行：`uvicorn main:app --host localhost --port 8000`")
     
     # 建立分頁
     tab0, tab1, tab2, tab3 = st.tabs(["Split Chart", "OOB/SPC 分析", "Tool Matching", "SPC CPK Dashboard"])
@@ -1965,7 +2140,9 @@ def main():
         st.markdown(f"**更新時間**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         if st.button("🔄 重新檢查連線", key="refresh_connection"):
+            st.session_state._api_checked = False  # 重設快取，強制重新打 health check
             check_api_connection()
+            st.session_state._api_checked = True
             st.rerun()
         st.markdown("---")
         if st.button("登出", key="logout_button"):

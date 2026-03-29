@@ -23,6 +23,181 @@ _ACCOUNTS = {
 }
 POLLING_INTERVAL = 2.0  # 輪詢頻率(秒)
 
+# ==========================================
+# 本地 CSV 拆分函數 (UI-local Split Logic)
+# ==========================================
+def _local_sanitize_fn(name: str) -> str:
+    for ch in '<>:"/\\|?*\'':
+        name = name.replace(ch, "")
+    return name.strip()
+
+def _local_read_csv(filepath: str, header_val=None) -> pd.DataFrame:
+    for enc in ["utf-8-sig", "utf-8", "big5", "cp950", "latin1", "cp1252"]:
+        try:
+            return pd.read_csv(filepath, header=header_val, encoding=enc)
+        except Exception:
+            pass
+    raise ValueError(f"無法讀取檔案: {os.path.basename(filepath)}")
+
+def _local_split_type3_horizontal(input_path: str, out_dir: str) -> bool:
+    try:
+        print(f"[LocalSplit][Type3_Horizontal] 讀取檔案: {os.path.basename(input_path)}")
+        df = _local_read_csv(input_path, header_val=None)
+        new_columns = []
+        for col1, col2 in zip(df.iloc[0], df.iloc[1]):
+            if pd.isna(col2):
+                new_columns.append(str(col1))
+            elif pd.isna(col1):
+                new_columns.append(str(col2))
+            else:
+                new_columns.append(f"{col1}_{col2}")
+        df = df.iloc[2:].copy()
+        df.columns = new_columns
+        chartname_col_name = None
+        for col in df.columns:
+            if "GroupName" in col and "ChartName" in col:
+                chartname_col_name = col
+                break
+        if chartname_col_name is None:
+            raise ValueError("Cannot find combined 'GroupName' and 'ChartName' header column")
+        chartname_idx = df.columns.get_loc(chartname_col_name)
+        universal_info_columns = df.columns[:chartname_idx + 1].tolist()
+        chart_columns = df.columns[chartname_idx + 1:]
+        for chart_col in chart_columns:
+            temp_df = df[universal_info_columns].copy()
+            temp_df["point_val"] = df[chart_col]
+            if "_" in chart_col:
+                groupname, chartname = chart_col.split("_", 1)
+            else:
+                groupname, chartname = "", chart_col
+            temp_df["GroupName"] = groupname
+            temp_df["ChartName"] = chartname
+            if "point_time" in temp_df.columns:
+                try:
+                    temp_df["point_time"] = pd.to_datetime(temp_df["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+                except Exception:
+                    pass
+            final_cols = ["GroupName", "ChartName", "point_time", "point_val"] + [
+                c for c in universal_info_columns
+                if c not in ["GroupName", "ChartName", "point_time", "point_val", chartname_col_name]
+            ]
+            existing = [c for c in final_cols if c in temp_df.columns]
+            temp_df = temp_df[existing]
+            fn = os.path.join(out_dir, f"{_local_sanitize_fn(str(groupname))}_{_local_sanitize_fn(str(chartname))}.csv")
+            if not temp_df.empty:
+                temp_df.to_csv(fn, index=False, encoding="utf-8-sig")
+        written = len([f for f in os.listdir(out_dir) if f.endswith(".csv")])
+        print(f"[LocalSplit][Type3_Horizontal] 完成，寫出 {written} 個 CSV")
+        return True
+    except Exception as e:
+        print(f"[LocalSplit][Type3_Horizontal] 失敗: {e}")
+        return False
+
+def _local_split_type2_vertical(input_path: str, out_dir: str) -> bool:
+    try:
+        print(f"[LocalSplit][Type2_Vertical] 讀取檔案: {os.path.basename(input_path)}")
+        df = _local_read_csv(input_path, header_val="infer")
+        if not all(c in df.columns for c in ["GroupName", "ChartName", "point_time", "point_val"]):
+            raise ValueError("Missing required columns for Type2_Vertical")
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        for _, row in df[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            g, c = row["GroupName"], row["ChartName"]
+            temp_df = df[(df["GroupName"] == g) & (df["ChartName"] == c)].copy()
+            other_cols = [col for col in temp_df.columns if col not in ["GroupName", "ChartName", "point_time", "point_val"]]
+            existing = [col for col in ["GroupName", "ChartName", "point_time", "point_val"] + other_cols if col in temp_df.columns]
+            temp_df[existing].to_csv(os.path.join(out_dir, f"{_local_sanitize_fn(str(g))}_{_local_sanitize_fn(str(c))}.csv"), index=False, encoding="utf-8-sig")
+        written = len([f for f in os.listdir(out_dir) if f.endswith(".csv")])
+        print(f"[LocalSplit][Type2_Vertical] 完成，寫出 {written} 個 CSV")
+        return True
+    except Exception as e:
+        print(f"[LocalSplit][Type2_Vertical] 失敗: {e}")
+        return False
+
+def _local_split_vendor_vertical(input_path: str, out_dir: str) -> bool:
+    try:
+        print(f"[LocalSplit][Vendor_Vertical] 讀取檔案: {os.path.basename(input_path)}")
+        df = _local_read_csv(input_path, header_val="infer")
+        col_map = {"Part ID": "GroupName", "Item Name": "ChartName", "Report Time": "point_time", "Lot Mean": "point_val", "Vendor Site": "Matching"}
+        missing = [k for k in col_map if k not in df.columns]
+        if missing:
+            raise ValueError(f"Missing vendor columns: {missing}")
+        df = df.rename(columns=col_map)
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        for _, row in df[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            g, c = row["GroupName"], row["ChartName"]
+            temp_df = df[(df["GroupName"] == g) & (df["ChartName"] == c)].copy()
+            other_cols = [col for col in temp_df.columns if col not in ["GroupName", "ChartName", "point_time", "point_val"]]
+            existing = [col for col in ["GroupName", "ChartName", "point_time", "point_val"] + other_cols if col in temp_df.columns]
+            temp_df[existing].to_csv(os.path.join(out_dir, f"{_local_sanitize_fn(str(g))}_{_local_sanitize_fn(str(c))}.csv"), index=False, encoding="utf-8-sig")
+        written = len([f for f in os.listdir(out_dir) if f.endswith(".csv")])
+        print(f"[LocalSplit][Vendor_Vertical] 完成，寫出 {written} 個 CSV")
+        return True
+    except Exception as e:
+        print(f"[LocalSplit][Vendor_Vertical] 失敗: {e}")
+        return False
+
+def _local_split_test_horizontal(input_path: str, out_dir: str) -> bool:
+    try:
+        print(f"[LocalSplit][Test_Horizontal] 讀取檔案: {os.path.basename(input_path)}")
+        df = _local_read_csv(input_path, header_val="infer")
+        col_map = {"Part ID": "GroupName", "FT Test End Time": "point_time", "Test Site": "Matching"}
+        missing = [k for k in col_map if k not in df.columns]
+        if missing:
+            raise ValueError(f"Missing test columns: {missing}")
+        df = df.rename(columns=col_map)
+        if "point_time" in df.columns:
+            try:
+                df["point_time"] = pd.to_datetime(df["point_time"], errors="coerce").dt.strftime("%Y/%m/%d %H:%M")
+            except Exception:
+                pass
+        matching_idx = df.columns.get_loc("Matching")
+        id_cols = df.columns[:matching_idx + 1].tolist()
+        value_cols = df.columns[matching_idx + 1:].tolist()
+        if not value_cols:
+            raise ValueError("No test item columns found after 'Matching' column")
+        df_melted = df.melt(id_vars=id_cols, value_vars=value_cols, var_name="ChartName", value_name="point_val").dropna(subset=["point_val"])
+        standard_cols = ["GroupName", "ChartName", "point_time", "point_val", "Matching"]
+        for _, row in df_melted[["GroupName", "ChartName"]].drop_duplicates().iterrows():
+            g, c = row["GroupName"], row["ChartName"]
+            temp_df = df_melted[(df_melted["GroupName"] == g) & (df_melted["ChartName"] == c)].copy()
+            existing = [col for col in standard_cols if col in temp_df.columns]
+            temp_df[existing].to_csv(os.path.join(out_dir, f"{_local_sanitize_fn(str(g))}_{_local_sanitize_fn(str(c))}.csv"), index=False, encoding="utf-8-sig")
+        written = len([f for f in os.listdir(out_dir) if f.endswith(".csv")])
+        print(f"[LocalSplit][Test_Horizontal] 完成，寫出 {written} 個 CSV")
+        return True
+    except Exception as e:
+        print(f"[LocalSplit][Test_Horizontal] 失敗: {e}")
+        return False
+
+def _local_split_file(input_path: str, mode: str) -> str:
+    """在本地執行 CSV 拆分，回傳 split_data 絕對路徑；失敗時拋出 Exception。"""
+    split_dir = os.path.abspath(os.path.join("temp_uploads", str(uuid.uuid4()), "split_data"))
+    os.makedirs(split_dir, exist_ok=True)
+    print(f"[LocalSplit] 開始拆分 | mode={mode} | input={input_path} | output_dir={split_dir}")
+    dispatch = {
+        "Type3_Horizontal": _local_split_type3_horizontal,
+        "Type2_Vertical":   _local_split_type2_vertical,
+        "Vendor_Vertical":  _local_split_vendor_vertical,
+        "Test_Horizontal":  _local_split_test_horizontal,
+    }
+    fn = dispatch.get(mode)
+    if fn is None:
+        raise ValueError(f"Unknown split mode: {mode}")
+    ok = fn(input_path, split_dir)
+    if not ok:
+        raise RuntimeError(f"Split failed for mode: {mode}")
+    output_files = os.listdir(split_dir)
+    print(f"[LocalSplit] 拆分完成 | mode={mode} | 產出 {len(output_files)} 個檔案 | dir={split_dir}")
+    return split_dir
+
 st.set_page_config(page_title="OSAT SPC System", layout="wide")
 
 # --- CSS：優化進度條顏色、隱藏預設 Header、調整版面 ---
@@ -429,18 +604,14 @@ with col1:
                             detected_split_mode = "Type3_Horizontal"
 
                     if detected_split_mode:
-                        split_resp = requests.post(
-                            f"{API_BASE_URL}/split",
-                            json={"mode": detected_split_mode, "input_files": [os.path.abspath(first_saved)]},
-                            timeout=120,
-                        )
-                        if split_resp.status_code == 200:
-                            split_result = split_resp.json()
-                            st.session_state.saved_split_id = split_result.get("split_id")
-                            st.session_state.saved_split_raw_dir = split_result.get("raw_data_directory")
+                        try:
+                            with st.spinner("正在自動準備資料夾..."):
+                                split_data_dir = _local_split_file(first_saved, detected_split_mode)
+                            st.session_state.saved_split_raw_dir = split_data_dir
+                            st.session_state.saved_split_id = None
                             st.session_state.saved_split_info = f"🔀 自動偵測到 **{detected_split_mode}** 格式，已完成拆分"
-                        else:
-                            st.error(f"⚠️ 自動拆分失敗（HTTP {split_resp.status_code}）")
+                        except Exception as split_err:
+                            st.error(f"⚠️ 自動拆分失敗：{str(split_err)}")
                 except Exception as e:
                     st.error(f"⚠️ 讀取或拆分檔案時發生錯誤：{str(e)}")
 
@@ -448,7 +619,6 @@ with col1:
             if not current_excel_path: current_excel_path = st.session_state.get("saved_excel_path")
             if not current_raw_dir: current_raw_dir = st.session_state.get("saved_raw_dir")
             
-            auto_split_id = st.session_state.get("saved_split_id")
             auto_split_raw_dir = st.session_state.get("saved_split_raw_dir")
             st.session_state.auto_split_info = st.session_state.get("saved_split_info")
 
@@ -462,8 +632,7 @@ with col1:
             if mode == "OOB/SPC":
                 endpoint = "/process"
                 if current_excel_path: payload["filepath"] = current_excel_path
-                if auto_split_id: payload["split_id"] = auto_split_id
-                elif auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
+                if auto_split_raw_dir: payload["raw_data_directory"] = auto_split_raw_dir
                 elif current_raw_dir: payload["raw_data_directory"] = current_raw_dir
                 
             elif mode == "Tool Matching":
